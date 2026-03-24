@@ -70,6 +70,13 @@ internal sealed partial class ExecutionManagerCore<T> : IExecutionManager
         TYPE_INTERPRETER = 3
     };
 
+    private enum CodeHeapType : byte
+    {
+        LoaderCodeHeap  = 0,
+        HostCodeHeap    = 1,
+        UnknownCodeHeap = 0xff,
+    }
+
     private enum ExceptionClauseFlags_1 : uint
     {
         Filter = 0x1,
@@ -372,6 +379,42 @@ internal sealed partial class ExecutionManagerCore<T> : IExecutionManager
             CodeType = 0, // miManaged | miIL
             HeapListAddress = jitManager.AllCodeHeaps,
         };
+    }
+
+    Contracts.CodeHeapType IExecutionManager.GetCodeHeapType(TargetPointer codeHeapAddress)
+    {
+        Data.CodeHeap codeHeap = _target.ProcessedData.GetOrAdd<Data.CodeHeap>(codeHeapAddress);
+        return (CodeHeapType)codeHeap.HeapType switch
+        {
+            CodeHeapType.LoaderCodeHeap  => Contracts.CodeHeapType.LoaderCodeHeap,
+            CodeHeapType.HostCodeHeap    => Contracts.CodeHeapType.HostCodeHeap,
+            _                            => Contracts.CodeHeapType.UnknownCodeHeap,
+        };
+    }
+
+    TargetPointer IExecutionManager.GetLoaderCodeHeapInfo(TargetPointer codeHeapAddress)
+    {
+        Data.LoaderCodeHeap loaderCodeHeap = _target.ProcessedData.GetOrAdd<Data.LoaderCodeHeap>(codeHeapAddress);
+        return loaderCodeHeap.LoaderHeap;
+    }
+
+    void IExecutionManager.GetHostCodeHeapInfo(TargetPointer codeHeapAddress, out TargetPointer baseAddress, out TargetPointer currentAddress)
+    {
+        Data.HostCodeHeap hostCodeHeap = _target.ProcessedData.GetOrAdd<Data.HostCodeHeap>(codeHeapAddress);
+        baseAddress = hostCodeHeap.BaseAddress;
+        currentAddress = hostCodeHeap.CurrentAddress;
+    }
+
+    TargetPointer IExecutionManager.GetCodeHeapListNodeNext(TargetPointer nodeAddress)
+    {
+        Data.CodeHeapListNode node = _target.ProcessedData.GetOrAdd<Data.CodeHeapListNode>(nodeAddress);
+        return node.Next;
+    }
+
+    TargetPointer IExecutionManager.GetCodeHeapListNodeHeap(TargetPointer nodeAddress)
+    {
+        Data.CodeHeapListNode node = _target.ProcessedData.GetOrAdd<Data.CodeHeapListNode>(nodeAddress);
+        return node.Heap;
     }
 
     private RangeSection RangeSectionFromCodeBlockHandle(CodeBlockHandle codeInfoHandle)

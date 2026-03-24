@@ -444,6 +444,17 @@ public struct DacpJitManagerInfo
     public ClrDataAddress ptrHeapList;
 };
 
+// Mirror of the native DacpJitCodeHeapInfo (dacprivate.h).
+// The union is represented with LayoutKind.Explicit.
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 0x18)]
+public struct DacpJitCodeHeapInfo
+{
+    [System.Runtime.InteropServices.FieldOffset(0)]  public int codeHeapType;   // CODEHEAP_LOADER=0, CODEHEAP_HOST=1, CODEHEAP_UNKNOWN=0xff
+    [System.Runtime.InteropServices.FieldOffset(8)]  public ClrDataAddress LoaderHeap;    // valid when codeHeapType == CODEHEAP_LOADER
+    [System.Runtime.InteropServices.FieldOffset(8)]  public ClrDataAddress baseAddr;      // valid when codeHeapType == CODEHEAP_HOST
+    [System.Runtime.InteropServices.FieldOffset(0x10)] public ClrDataAddress currentAddr; // valid when codeHeapType == CODEHEAP_HOST
+};
+
 public struct DacpSyncBlockData
 {
     public enum COMFlagsEnum : uint

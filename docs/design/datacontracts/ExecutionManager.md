@@ -46,11 +46,33 @@ struct CodeBlockHandle
     // Gets information about the EEJitManager: its address, code type, and head of the code heap list.
     JitManagerInfo GetEEJitManagerInfo();
 
+    // Gets the concrete type of the code heap at the given address.
+    CodeHeapType GetCodeHeapType(TargetPointer codeHeapAddress);
+    // Gets the address of the embedded ExplicitControlLoaderHeap within a LoaderCodeHeap object.
+    // Only valid when GetCodeHeapType returns CodeHeapType.LoaderCodeHeap.
+    TargetPointer GetLoaderCodeHeapInfo(TargetPointer codeHeapAddress);
+    // Gets the base and current committed addresses of a HostCodeHeap object.
+    // Only valid when GetCodeHeapType returns CodeHeapType.HostCodeHeap.
+    void GetHostCodeHeapInfo(TargetPointer codeHeapAddress, out TargetPointer baseAddress, out TargetPointer currentAddress);
+    // Gets the Heap pointer stored in a CodeHeapListNode.
+    TargetPointer GetCodeHeapListNodeHeap(TargetPointer nodeAddress);
+    // Gets the Next pointer stored in a CodeHeapListNode (the next node in the linked list).
+    TargetPointer GetCodeHeapListNodeNext(TargetPointer nodeAddress);
+
     // Get the exception clause info for the code block
     List<ExceptionClauseInfo> GetExceptionClauses(CodeBlockHandle codeInfoHandle);
 
     // Extension Methods (implemented in terms of other APIs)
     bool IsFunclet(CodeBlockHandle codeInfoHandle);
+```
+
+```csharp
+public enum CodeHeapType : byte
+{
+    LoaderCodeHeap  = 0,
+    HostCodeHeap    = 1,
+    UnknownCodeHeap = 0xff,
+}
 ```
 
 ```csharp
@@ -106,6 +128,11 @@ Data descriptors used:
 | `CodeHeapListNode` | `EndAddress` | End address of the used portion of the code heap |
 | `CodeHeapListNode` | `MapBase` | Start of the map - start address rounded down based on OS page size |
 | `CodeHeapListNode` | `HeaderMap` | Bit array used to find the start of methods - relative to `MapBase` |
+| `CodeHeapListNode` | `Heap` | Pointer to the `CodeHeap` object managed by this node |
+| `CodeHeap` | `HeapType` | `uint8` discriminant identifying the concrete heap type (`CodeHeapType` enum: `LoaderCodeHeap`=0, `HostCodeHeap`=1, `UnknownCodeHeap`=0xff) |
+| `LoaderCodeHeap` | `LoaderHeap` | Offset of the embedded `ExplicitControlLoaderHeap` within the `LoaderCodeHeap` object; adding this to the object's base address yields the loader heap address |
+| `HostCodeHeap` | `BaseAddress` | Pointer to the base of the committed memory region |
+| `HostCodeHeap` | `CurrentAddress` | Pointer to the last available committed byte in the region |
 | `EEJitManager` | `StoreRichDebugInfo` | Boolean value determining if debug info associated with the JitManager contains rich info. |
 | `EEJitManager` | `AllCodeHeaps` | Pointer to the head of the linked list of all code heaps managed by the EEJitManager. |
 | `RealCodeHeader` | `MethodDesc` | Pointer to the corresponding `MethodDesc` |
