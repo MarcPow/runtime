@@ -70,13 +70,6 @@ internal sealed partial class ExecutionManagerCore<T> : IExecutionManager
         TYPE_INTERPRETER = 3
     };
 
-    private enum CodeHeapType : byte
-    {
-        LoaderCodeHeap  = 0,
-        HostCodeHeap    = 1,
-        UnknownCodeHeap = 0xff,
-    }
-
     private enum ExceptionClauseFlags_1 : uint
     {
         Filter = 0x1,
@@ -384,11 +377,11 @@ internal sealed partial class ExecutionManagerCore<T> : IExecutionManager
     Contracts.CodeHeapType IExecutionManager.GetCodeHeapType(TargetPointer codeHeapAddress)
     {
         Data.CodeHeap codeHeap = _target.ProcessedData.GetOrAdd<Data.CodeHeap>(codeHeapAddress);
-        return (CodeHeapType)codeHeap.HeapType switch
+        return (Contracts.CodeHeapType)codeHeap.HeapType switch
         {
-            CodeHeapType.LoaderCodeHeap  => Contracts.CodeHeapType.LoaderCodeHeap,
-            CodeHeapType.HostCodeHeap    => Contracts.CodeHeapType.HostCodeHeap,
-            _                            => Contracts.CodeHeapType.UnknownCodeHeap,
+            Contracts.CodeHeapType.LoaderCodeHeap => Contracts.CodeHeapType.LoaderCodeHeap,
+            Contracts.CodeHeapType.HostCodeHeap   => Contracts.CodeHeapType.HostCodeHeap,
+            _                                     => Contracts.CodeHeapType.UnknownCodeHeap,
         };
     }
 

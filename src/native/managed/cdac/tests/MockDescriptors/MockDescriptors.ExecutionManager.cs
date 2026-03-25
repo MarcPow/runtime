@@ -233,10 +233,14 @@ internal partial class MockDescriptors
             DataType = DataType.CodeHeap,
             Fields =
             [
-                // Two pointer-sized padding fields ensure HeapType sits at offset 2*pointer_size,
-                // beyond the region used by derived-type fields (LoaderCodeHeap: 1 pointer;
-                // HostCodeHeap: 2 pointers).  This mirrors the real layout where m_heapType
-                // follows the vtable pointer and any base-class padding.
+                // In the real runtime, m_heapType follows the vtable pointer (and any padding)
+                // at offset >= pointer_size inside CodeHeap.  To avoid overlapping with derived
+                // class fields (LoaderCodeHeap has 1 pointer at offset 0; HostCodeHeap has 2
+                // pointers at offsets 0 and pointer_size), we insert two pointer-sized padding
+                // fields here so that HeapType lands at offset 2*pointer_size — past the largest
+                // derived-class layout.  This keeps the mock layout self-consistent: both
+                // DataType.CodeHeap and the derived DataType can be read from the same base
+                // address without their fields overlapping.
                 new("_vtablePtr",    DataType.pointer),
                 new("_heapTypePad",  DataType.pointer),
                 new(nameof(Data.CodeHeap.HeapType), DataType.uint8),
