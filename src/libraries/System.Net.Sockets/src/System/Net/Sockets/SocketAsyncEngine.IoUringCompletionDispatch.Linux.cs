@@ -23,7 +23,7 @@ namespace System.Net.Sockets
             }
 
             /// <summary>Delivers a completed operation to its owning socket context.</summary>
-            private void DispatchCompletedIoUringOperation(SocketAsyncContext.AsyncOperation operation)
+            private static void DispatchCompletedIoUringOperation(SocketAsyncContext.AsyncOperation operation)
             {
                 operation.AssociatedContext.TryCompleteIoUringOperation(operation);
             }

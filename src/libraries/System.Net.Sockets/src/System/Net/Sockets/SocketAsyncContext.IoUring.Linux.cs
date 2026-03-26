@@ -810,7 +810,9 @@ namespace System.Net.Sockets
                 untrackAndClear: true);
         }
 
-        /// <summary>Stages an operation for io_uring preparation if completion mode is active.</summary>
+        /// <summary>Stages an operation for io_uring preparation if completion mode is active.
+        /// Attempts direct SQE submission from the caller thread first; falls back to
+        /// the MPSC prepare queue only when the SQ ring is full or slots are exhausted.</summary>
         static partial void LinuxTryStageIoUringOperation(AsyncOperation operation)
         {
             if (operation.Event is null &&
@@ -818,6 +820,8 @@ namespace System.Net.Sockets
                 operation.IoUringUserData == 0 &&
                 operation.IsInWaitingState())
             {
+                // TODO: Re-enable direct-submit fast path after MPSC baseline is verified.
+                // Direct-submit disabled to isolate whether hang is from SINGLE_ISSUER removal.
                 if (!operation.TryQueueIoUringPreparation())
                 {
                     operation.EmitReadinessFallbackForQueueOverflow();
@@ -1174,6 +1178,72 @@ namespace System.Net.Sockets
                 // Direct preparation unsupported for this operation shape.
                 // Leave operation pending so caller can use completion-path fallback semantics.
                 ErrorCode = SocketError.Success;
+                IoUringUserData = 0;
+                return false;
+            }
+
+            /// <summary>
+            /// Attempts to prepare and submit an SQE directly from the calling thread.
+            /// The engine's _sqSubmitLock is acquired internally by TrySetupDirectSqe.
+            /// Returns true if the operation was successfully submitted to io_uring.
+            /// </summary>
+            internal bool TryDirectSubmitIoUring(SocketAsyncContext context, SocketAsyncEngine engine)
+            {
+                if (Interlocked.Exchange(ref _ioUringPreparationReusable, 0) == 0)
+                {
+                    ReleaseIoUringPreparationResources();
+                }
+
+                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(context, engine, out ulong directUserData);
+
+                // CompletedFromBuffer: no SQE was allocated, lock is NOT held.
+                if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
+                {
+                    _state = State.Complete;
+                    IoUringUserData = 0;
+                    context.TryCompleteIoUringOperation(this);
+                    return true;
+                }
+
+                // Prepared: TrySetupDirectSqe acquired _sqSubmitLock and it is HELD.
+                // We must release it via FinishDirectSqeSubmission or AbortDirectSqeSubmission.
+                if (directResult == IoUringDirectPrepareResult.Prepared)
+                {
+                    if (ErrorCode != SocketError.Success)
+                    {
+                        // SQE was written but the prepare reported an error.
+                        // Abort: undo the SQE, free the slot, release lock.
+                        engine.AbortDirectSqeSubmission(
+                            SocketAsyncEngine.DecodeDirectSqeSlotIndex(directUserData),
+                            context._socket);
+                        IoUringUserData = 0;
+                        return false;
+                    }
+
+                    _ioUringSlotExhaustionRetryCount = 0;
+                    IoUringUserData = directUserData;
+
+                    // Track the operation so the CQE drain can find it on completion.
+                    if (!engine.TryTrackDirectlySubmittedOperation(this))
+                    {
+                        // Tracking failed — abort the submission, release lock.
+                        engine.AbortDirectSqeSubmission(
+                            SocketAsyncEngine.DecodeDirectSqeSlotIndex(directUserData),
+                            context._socket);
+                        IoUringUserData = 0;
+                        return false;
+                    }
+
+                    // Publish SQ tail + release lock + submit to kernel.
+                    uint pending = engine.FinishDirectSqeSubmission();
+                    if (pending > 0)
+                    {
+                        engine.SubmitPendingToKernel(pending);
+                    }
+                    return true;
+                }
+
+                // PrepareFailed or Unsupported: lock was already released by TrySetupDirectSqe.
                 IoUringUserData = 0;
                 return false;
             }

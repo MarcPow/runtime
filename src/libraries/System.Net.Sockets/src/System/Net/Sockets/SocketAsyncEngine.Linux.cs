@@ -698,6 +698,12 @@ namespace System.Net.Sockets
         // All inputs are read once per process and cached in s_cachedConfigInputs.
         private static readonly object s_affinityGrowLock = new object();
 
+        /// <summary>
+        /// Protects SQ ring tail manipulation, SQ tail publication, and completion slot free-list
+        /// access. Allows any thread to submit SQEs without the cross-thread MPSC queue hop.
+        /// </summary>
+        private readonly Lock _sqSubmitLock = new Lock();
+
         internal static void SetFdEngineAffinity(int fd, int engineIndex)
         {
             int[]? affinity = s_fdEngineAffinity;
@@ -784,7 +790,6 @@ namespace System.Net.Sockets
         // to prevent new io_uring work from being published after teardown begins.
         private int _ioUringTeardownInitiated;
         private int _ioUringSlotCapacity;
-        private bool _completionSlotDrainInProgress;
         private bool _cqOverflowRecoveryActive;
         private IoUringCqOverflowRecoveryBranch _cqOverflowRecoveryBranch;
         private long _cqOverflowTrackedSweepDeadlineTicks;
@@ -827,6 +832,7 @@ namespace System.Net.Sockets
         private int _completionSlotFreeListHead = -1;
         private int _completionSlotsInUse;
         // Event-loop hot state above this line, then cross-thread queue/counter state.
+#pragma warning disable CA1823 // Intentional cache line padding
         private CacheLinePadding64 _ioUringEventLoopToContendedPadding;
         private long _ioUringPrepareQueueLength;
         private long _ioUringCancelQueueLength;
@@ -834,6 +840,7 @@ namespace System.Net.Sockets
         private uint _ioUringWakeupGeneration;
         // Cross-thread contended state above, cold diagnostics/published counters below.
         private CacheLinePadding64 _ioUringContendedToDiagnosticsPadding;
+#pragma warning restore CA1823
         private int _completionSlotsHighWaterMark;
         private int _liveAcceptCompletionSlotCount;
         private bool _pendingEventFdRead;
@@ -1070,7 +1077,7 @@ namespace System.Net.Sockets
         private unsafe bool TryPeekNextCqe(out Interop.Sys.IoUringCqe* cqe, int eventLoopThreadId)
         {
             Debug.Assert(eventLoopThreadId == Environment.CurrentManagedThreadId,
-                "TryPeekNextCqe must only be called from the event loop thread (SINGLE_ISSUER contract).");
+                "TryPeekNextCqe must only be called from the event loop thread (CQ drain is event-loop-only).");
             cqe = null;
             uint cqTail = Volatile.Read(ref *_ringState.CqTailPtr);
             if (_ringState.CachedCqHead == cqTail) return false;
@@ -1084,7 +1091,7 @@ namespace System.Net.Sockets
         private unsafe void AdvanceCqHead(uint count, int eventLoopThreadId)
         {
             Debug.Assert(eventLoopThreadId == Environment.CurrentManagedThreadId,
-                "AdvanceCqHead must only be called from the event loop thread (SINGLE_ISSUER contract).");
+                "AdvanceCqHead must only be called from the event loop thread (CQ drain is event-loop-only).");
             _ringState.CachedCqHead += count;
             Volatile.Write(ref *_ringState.CqHeadPtr, _ringState.CachedCqHead);
         }
@@ -1186,7 +1193,7 @@ namespace System.Net.Sockets
         {
             int eventLoopThreadId = Volatile.Read(ref _eventLoopManagedThreadId);
             Debug.Assert(eventLoopThreadId == Environment.CurrentManagedThreadId,
-                "DrainCqeRingBatch must only be called from the event loop thread (SINGLE_ISSUER contract).");
+                "DrainCqeRingBatch must only be called from the event loop thread (CQ drain is event-loop-only).");
             ObserveManagedCqOverflowCounter();
             int drained = 0;
             int drainLimit = _cqOverflowRecoveryActive
@@ -1767,7 +1774,7 @@ namespace System.Net.Sockets
             }
 
             // Sweep for orphaned SEND_ZC completion slots whose NOTIF CQE was lost to CQ overflow.
-            int zeroCopyOrphanCount = SweepOrphanedZeroCopyNotificationSlots(completionEntries, trackedOperations);
+            _ = SweepOrphanedZeroCopyNotificationSlots(completionEntries, trackedOperations);
 
             if (canceledWaitingCount != 0)
             {
@@ -2035,7 +2042,8 @@ namespace System.Net.Sockets
             return (ops[opcode].Flags & IoUringConstants.ProbeOpFlagSupported) != 0;
         }
 
-        /// <summary>Publishes the managed SQ tail pointer to make queued SQEs visible to the kernel.</summary>
+        /// <summary>Publishes the managed SQ tail pointer to make queued SQEs visible to the kernel.
+        /// Caller must hold <see cref="_sqSubmitLock"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void PublishManagedSqeTail()
         {
@@ -2044,8 +2052,8 @@ namespace System.Net.Sockets
                 return;
             }
 
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "PublishManagedSqeTail must only be called from the event loop thread (SINGLE_ISSUER contract).");
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
+                "PublishManagedSqeTail must be called while holding _sqSubmitLock.");
             ref uint sqTailRef = ref Unsafe.AsRef<uint>((void*)_ioUringSqRingInfo.SqTailPtr);
             Volatile.Write(ref sqTailRef, _ioUringManagedSqTail);
             _ioUringManagedSqTailLoaded = false;
@@ -2066,7 +2074,8 @@ namespace System.Net.Sockets
             return (Volatile.Read(ref *_ringState.SqFlagsPtr) & IoUringConstants.SqNeedWakeup) != 0;
         }
 
-        /// <summary>Allocates the next available SQE slot from the submission ring.</summary>
+        /// <summary>Allocates the next available SQE slot from the submission ring.
+        /// Caller must hold <see cref="_sqSubmitLock"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe bool TryGetNextManagedSqe(out IoUringSqe* sqe)
         {
@@ -2076,8 +2085,8 @@ namespace System.Net.Sockets
                 return false;
             }
 
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "TryGetNextManagedSqe must only be called from the event loop thread (SINGLE_ISSUER contract).");
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
+                "TryGetNextManagedSqe must be called while holding _sqSubmitLock.");
             if (!_managedSqeInvariantsValidated)
             {
                 return false;
@@ -2138,22 +2147,26 @@ namespace System.Net.Sockets
             return true;
         }
 
-        /// <summary>Attempts to acquire an SQE, retrying with intermediate submits on ring full.</summary>
+        /// <summary>Attempts to acquire an SQE, retrying with intermediate submits on ring full.
+        /// Event-loop only — acquires <see cref="_sqSubmitLock"/> internally for each attempt.</summary>
         private unsafe bool TryAcquireManagedSqeWithRetry(out IoUringSqe* sqe, out Interop.Error submitError)
         {
             sqe = null;
             submitError = Interop.Error.SUCCESS;
             Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "TryAcquireManagedSqeWithRetry must only be called from the event loop thread (SINGLE_ISSUER contract).");
+                "TryAcquireManagedSqeWithRetry is event-loop-only (uses CQ drain for retry).");
             SocketEventHandler drainHandler = default;
             bool drainHandlerInitialized = false;
 
             for (int attempt = 0; attempt < MaxIoUringSqeAcquireSubmitAttempts; attempt++)
             {
+                _sqSubmitLock.Enter();
                 if (TryGetNextManagedSqe(out sqe))
                 {
+                    // Lock held — caller writes SQE, then calls FinishDirectSqeSubmission to publish + release.
                     return true;
                 }
+                _sqSubmitLock.Exit();
 
                 // Before retrying submission, run a CQ drain pass so completions can release
                 // slots and unblock kernel forward progress. The overflow counter is observed
@@ -2169,10 +2182,12 @@ namespace System.Net.Sockets
                     }
                     _ = DrainCqeRingBatch(drainHandler);
 
+                    _sqSubmitLock.Enter();
                     if (TryGetNextManagedSqe(out sqe))
                     {
                         return true;
                     }
+                    _sqSubmitLock.Exit();
                 }
 
                 submitError = SubmitIoUringOperationsNormalized();
@@ -2205,10 +2220,12 @@ namespace System.Net.Sockets
         /// <summary>
         /// Prepares a direct SQE and returns all setup data as a single struct to avoid large
         /// out-parameter callsites in per-opcode prepare paths.
+        /// Acquires <see cref="_sqSubmitLock"/> internally. Callable from any thread.
         /// </summary>
         /// <returns>
         /// <see cref="SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared"/> if the SQE was acquired
-        /// (caller must write the SQE and return Prepared),
+        /// (caller must write the SQE and return Prepared — the lock is held and will be released
+        /// by <see cref="FinishDirectSqeSubmission"/>),
         /// or a terminal result (Unsupported/PrepareFailed) that the caller should return directly.
         /// </returns>
         private unsafe IoUringDirectSqeSetupResult TrySetupDirectSqe(
@@ -2225,33 +2242,16 @@ namespace System.Net.Sockets
                 return setup;
             }
 
+            // Acquire lock for slot allocation + SQE acquisition.
+            // Lock is held through SQE write and released by FinishDirectSqeSubmission.
+            _sqSubmitLock.Enter();
+
             int slotIndex = AllocateCompletionSlot();
             if (slotIndex < 0)
             {
-                // Event-loop-only counter; cross-thread reads use Interlocked.Read.
-                _ioUringCompletionSlotExhaustionCount++;
-
-                if (!_completionSlotDrainInProgress)
-                {
-                    _completionSlotDrainInProgress = true;
-                    try
-                    {
-                        SocketEventHandler handler = new SocketEventHandler(this);
-                        if (DrainCqeRingBatch(handler))
-                        {
-                            slotIndex = AllocateCompletionSlot();
-                        }
-                    }
-                    finally
-                    {
-                        _completionSlotDrainInProgress = false;
-                    }
-                }
-
-                if (slotIndex < 0)
-                {
-                    return setup;
-                }
+                Interlocked.Increment(ref _ioUringCompletionSlotExhaustionCount);
+                _sqSubmitLock.Exit();
+                return setup;
             }
 
             setup.SlotIndex = slotIndex;
@@ -2267,7 +2267,8 @@ namespace System.Net.Sockets
             }
             catch (ObjectDisposedException)
             {
-                FreeCompletionSlot(slotIndex);
+                FreeCompletionSlotUnderLock(slotIndex);
+                _sqSubmitLock.Exit();
                 setup.SlotIndex = -1;
                 setup.ErrorCode = SocketError.OperationAborted;
                 setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.PrepareFailed;
@@ -2276,7 +2277,8 @@ namespace System.Net.Sockets
 
             if (!addedSocketRef)
             {
-                FreeCompletionSlot(slotIndex);
+                FreeCompletionSlotUnderLock(slotIndex);
+                _sqSubmitLock.Exit();
                 setup.SlotIndex = -1;
                 setup.ErrorCode = SocketError.OperationAborted;
                 setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.PrepareFailed;
@@ -2284,9 +2286,6 @@ namespace System.Net.Sockets
             }
 
             slotStorage.DangerousRefSocketHandle = socket;
-            // GC/rooting contract for fd lifetime:
-            // Engine -> _completionSlotStorage[slotIndex].DangerousRefSocketHandle -> SafeSocketHandle.
-            // Keep this chain alive across SQE submission through CQE retirement to avoid fd reuse races.
             SafeSocketHandle? operation = slotStorage.DangerousRefSocketHandle;
             Debug.Assert(operation != null);
             int socketFd = (int)(nint)operation!.DangerousGetHandle();
@@ -2294,27 +2293,121 @@ namespace System.Net.Sockets
             setup.SqeFlags = 0;
             ApplyDebugTestForcedResult(ref slot, opcode);
 
-            if (!TryAcquireManagedSqeWithRetry(out IoUringSqe* sqe, out Interop.Error submitError))
+            if (!TryGetNextManagedSqe(out IoUringSqe* sqe))
             {
                 RestoreDebugTestForcedResultIfNeeded(slotIndex, opcode);
-                FreeCompletionSlot(slotIndex);
+                // Release socket ref before freeing slot (slot free also releases, avoid double-release)
+                slotStorage.DangerousRefSocketHandle = null;
+                socket.DangerousRelease();
+                FreeCompletionSlotUnderLock(slotIndex);
+                _sqSubmitLock.Exit();
                 setup.SlotIndex = -1;
-
-                if (submitError == Interop.Error.SUCCESS ||
-                    submitError == Interop.Error.EAGAIN ||
-                    submitError == Interop.Error.EWOULDBLOCK)
-                {
-                    return setup;
-                }
-
-                setup.ErrorCode = SocketPal.GetSocketErrorForErrorCode(submitError);
-                setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.PrepareFailed;
                 return setup;
             }
 
+            // Lock remains held — caller writes SQE fields, then calls FinishDirectSqeSubmission.
             setup.Sqe = sqe;
             setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared;
             return setup;
+        }
+
+        /// <summary>
+        /// Returns a completion slot to the free list while already holding <see cref="_sqSubmitLock"/>.
+        /// Minimal cleanup — only resets free-list bookkeeping. Used in error paths within TrySetupDirectSqe.
+        /// </summary>
+        private void FreeCompletionSlotUnderLock(int slotIndex)
+        {
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            ref IoUringCompletionSlot slot = ref _completionSlots![slotIndex];
+            ref IoUringTrackedOperationState trackedState = ref _trackedOperations![slotIndex];
+            slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
+            if (slot.Generation == 0) slot.Generation = 1;
+            slot.Kind = IoUringCompletionOperationKind.None;
+            slot.ClearZeroCopyState();
+            Volatile.Write(ref trackedState.TrackedOperation, null);
+            trackedState.TrackedOperationGeneration = 0;
+            slot.FreeListNext = _completionSlotFreeListHead;
+            _completionSlotFreeListHead = slotIndex;
+            _completionSlotsInUse--;
+        }
+
+        /// <summary>
+        /// Publishes the SQ tail and releases <see cref="_sqSubmitLock"/> after a successful SQE write.
+        /// Must be called after TrySetupDirectSqe returns Prepared and the caller has written SQE fields.
+        /// Returns the number of pending submissions so the caller can decide whether to call io_uring_enter.
+        /// </summary>
+        internal unsafe uint FinishDirectSqeSubmission()
+        {
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            PublishManagedSqeTail();
+            uint pending = _ioUringManagedPendingSubmissions;
+            _ioUringManagedPendingSubmissions = 0;
+            _ioUringManagedSqTailLoaded = false; // Force re-read from kernel on next SQE acquisition
+            _sqSubmitLock.Exit();
+            return pending;
+        }
+
+        /// <summary>
+        /// Releases <see cref="_sqSubmitLock"/> without publishing (used on error paths after TrySetupDirectSqe
+        /// returned Prepared but before SQE write completed successfully).
+        /// </summary>
+        internal void AbortDirectSqeSubmission(int slotIndex, SafeSocketHandle socket)
+        {
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            ref IoUringCompletionSlotStorage slotStorage = ref _completionSlotStorage![slotIndex];
+            slotStorage.DangerousRefSocketHandle = null;
+            socket.DangerousRelease();
+            // Undo the SQ tail bump (we got an SQE but won't use it)
+            _ioUringManagedSqTail--;
+            _ioUringManagedPendingSubmissions--;
+            FreeCompletionSlotUnderLock(slotIndex);
+            _sqSubmitLock.Exit();
+        }
+
+        /// <summary>Decodes the completion slot index from a user_data value. Used by abort paths.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int DecodeDirectSqeSlotIndex(ulong userData)
+        {
+            return DecodeCompletionSlotIndex(userData & IoUringUserDataPayloadMask);
+        }
+
+        /// <summary>
+        /// Tracks a directly-submitted operation so the CQE drain loop can find it on completion.
+        /// Called from any thread while _sqSubmitLock is held (from TrySetupDirectSqe).
+        /// </summary>
+        internal bool TryTrackDirectlySubmittedOperation(SocketAsyncContext.AsyncOperation operation)
+        {
+            // _sqSubmitLock is still held from TrySetupDirectSqe
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            if (!TryDecodeTrackedIoUringUserData(operation.IoUringUserData, out int slotIndex, out ulong generation))
+            {
+                return false;
+            }
+
+            ref IoUringTrackedOperationState entry = ref _trackedOperations![slotIndex];
+            if (Volatile.Read(ref entry.TrackedOperationGeneration) == 0 &&
+                Volatile.Read(ref entry.TrackedOperation) is null)
+            {
+                Volatile.Write(ref entry.TrackedOperationGeneration, generation);
+                Volatile.Write(ref entry.TrackedOperation, operation);
+                Interlocked.Increment(ref _trackedIoUringOperationCount);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Submits pending SQEs to the kernel via io_uring_enter.
+        /// Callable from any thread (no SINGLE_ISSUER).
+        /// </summary>
+        internal void SubmitPendingToKernel(uint toSubmit)
+        {
+            if (toSubmit == 0) return;
+            uint enterFlags = 0;
+            int ringFd = _ringState.RingFd;
+            // io_uring_enter is safe from any thread without SINGLE_ISSUER.
+            IoUringEnterWithFallback(ref ringFd, toSubmit, 0, ref enterFlags, out _);
         }
 
         /// <summary>
@@ -2830,22 +2923,20 @@ namespace System.Net.Sockets
             setupResult = default;
             uint queueEntries = GetIoUringQueueEntries();
 
+            // SINGLE_ISSUER + DEFER_TASKRUN restored: the direct-submit path acquires
+            // _sqSubmitLock but all SQE writes and io_uring_enter calls still happen on
+            // the event loop thread (via the MPSC queue). Multi-thread submission will be
+            // re-enabled once the event loop completion wait is adapted for COOP_TASKRUN.
             uint flags = IoUringConstants.SetupCqSize | IoUringConstants.SetupSubmitAll
                        | IoUringConstants.SetupCoopTaskrun | IoUringConstants.SetupSingleIssuer
                        | IoUringConstants.SetupNoSqArray | IoUringConstants.SetupCloexec;
 
             if (sqPollRequested)
             {
-                // SQPOLL and DEFER_TASKRUN are mutually exclusive in practice.
                 flags |= IoUringConstants.SetupSqPoll;
             }
             else
             {
-                // DEFER_TASKRUN defers task work to io_uring_enter only, reducing event-loop
-                // CPU vs COOP_TASKRUN (which runs task work at every syscall boundary).
-                // Requires SINGLE_ISSUER and submitter_task == current on every io_uring_enter.
-                // io_uring_setup runs on the event loop thread (deferred from constructor) so
-                // submitter_task is set correctly for the event loop's io_uring_enter calls.
                 flags |= IoUringConstants.SetupDeferTaskrun;
             }
 
@@ -2853,7 +2944,7 @@ namespace System.Net.Sockets
             // IORING_SETUP_NO_SQARRAY: Linux 6.6.  IORING_SETUP_CLOEXEC: Linux 5.19.
             ReadOnlySpan<uint> flagsToPeel = [IoUringConstants.SetupNoSqArray, IoUringConstants.SetupCloexec];
 
-            Interop.Sys.IoUringParams ioParams = default;
+            Interop.Sys.IoUringParams ioParams;
             int ringFd;
             Interop.Error err;
             int peelIndex = 0;
@@ -2917,19 +3008,23 @@ namespace System.Net.Sockets
             if (_ringState.WakeupEventFd < 0)
                 return false;
 
-            if (!TryGetNextManagedSqe(out IoUringSqe* sqe))
-                return false;
+            lock (_sqSubmitLock)
+            {
+                if (!TryGetNextManagedSqe(out IoUringSqe* sqe))
+                    return false;
 
-            sqe->Opcode = IoUringOpcodes.PollAdd;
-            sqe->Flags = 0; // No SQE flags for wakeup poll.
-            sqe->Ioprio = 0; // Not used by POLL_ADD.
-            sqe->Fd = _ringState.WakeupEventFd;
-            sqe->Off = 0; // Not used by POLL_ADD.
-            sqe->Addr = 0; // Not used by POLL_ADD.
-            sqe->Len = IoUringConstants.PollAddFlagMulti; // IORING_POLL_ADD_MULTI
-            sqe->RwFlags = IoUringConstants.PollIn;
-            sqe->UserData = EncodeIoUringUserData(IoUringConstants.TagWakeupSignal, 0);
-            // BufIndex, Personality, SpliceFdIn, Addr3: zeroed by TryGetNextManagedSqe.
+                sqe->Opcode = IoUringOpcodes.PollAdd;
+                sqe->Flags = 0; // No SQE flags for wakeup poll.
+                sqe->Ioprio = 0; // Not used by POLL_ADD.
+                sqe->Fd = _ringState.WakeupEventFd;
+                sqe->Off = 0; // Not used by POLL_ADD.
+                sqe->Addr = 0; // Not used by POLL_ADD.
+                sqe->Len = IoUringConstants.PollAddFlagMulti; // IORING_POLL_ADD_MULTI
+                sqe->RwFlags = IoUringConstants.PollIn;
+                sqe->UserData = EncodeIoUringUserData(IoUringConstants.TagWakeupSignal, 0);
+                // BufIndex, Personality, SpliceFdIn, Addr3: zeroed by TryGetNextManagedSqe.
+                PublishManagedSqeTail();
+            }
             return true;
         }
 
@@ -3151,9 +3246,7 @@ namespace System.Net.Sockets
                 (_ringState.NegotiatedFlags & IoUringConstants.SetupDeferTaskrun) != 0;
             bool forceDeferredTaskWorkEnter = hadCqes && deferTaskrunEnabled;
 
-            // Fast-path: skip SubmitIoUringBatch when both cross-thread queues are empty.
-            // Inline re-prepare SQEs from DrainCqeRingBatch write directly to the SQ ring
-            // and are counted in _ioUringManagedPendingSubmissions without touching these queues.
+            // Drain the MPSC queues (prepare + cancel).
             if (Volatile.Read(ref _ioUringPrepareQueueLength) != 0 ||
                 Volatile.Read(ref _ioUringCancelQueueLength) != 0)
             {
@@ -3166,7 +3259,11 @@ namespace System.Net.Sockets
                 }
             }
 
-            uint submitCount = _sqPollEnabled ? 0u : _ioUringManagedPendingSubmissions;
+            uint submitCount;
+            lock (_sqSubmitLock)
+            {
+                submitCount = _sqPollEnabled ? 0u : _ioUringManagedPendingSubmissions;
+            }
             if (hadCqes && !forceDeferredTaskWorkEnter && submitCount == 0)
             {
                 numCompletions = 1;
@@ -3686,7 +3783,8 @@ namespace System.Net.Sockets
             return IoUringCancellationEnqueueResult.Failed;
         }
 
-        /// <summary>Writes an ASYNC_CANCEL SQE directly if the engine is on the event loop thread.</summary>
+        /// <summary>Writes an ASYNC_CANCEL SQE. Event-loop only (uses CQ drain for retry).
+        /// Lock is acquired by TryAcquireManagedSqeWithRetry and released after SQE write.</summary>
         private bool TryQueueIoUringAsyncCancel(ulong userData)
         {
             if (!_ioUringCapabilities.IsIoUringPort || userData == 0)
@@ -3699,7 +3797,9 @@ namespace System.Net.Sockets
                 return false;
             }
 
+            // Lock is held from TryAcquireManagedSqeWithRetry
             WriteAsyncCancelSqe(sqe, userData);
+            FinishDirectSqeSubmission();
             return true;
         }
 
@@ -3748,9 +3848,8 @@ namespace System.Net.Sockets
         }
 
         /// <summary>
-        /// Wakes the io_uring event loop to process deferred cancel CQEs produced by
-        /// shutdown/disconnect during SafeSocketHandle.CloseAsIs. With DEFER_TASKRUN,
-        /// these CQEs are queued as task work and only processed during io_uring_enter.
+        /// Wakes the io_uring event loop to process cancel CQEs produced by
+        /// shutdown/disconnect during SafeSocketHandle.CloseAsIs.
         /// </summary>
         partial void LinuxWakeIoUringEventLoopForSocketClose()
         {
@@ -3897,7 +3996,7 @@ namespace System.Net.Sockets
             }
 
             Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "SubmitIoUringBatch must only be called from the event loop thread (SINGLE_ISSUER contract).");
+                "SubmitIoUringBatch must only be called from the event loop thread.");
             bool preparedSqe = false;
             if (_ioUringCapabilities.IsCompletionMode)
             {
@@ -4190,11 +4289,13 @@ namespace System.Net.Sockets
         private unsafe Interop.Error IoUringEnterWithFallback(
             ref int ringFd, uint toSubmit, uint minComplete, ref uint enterFlags, out int result)
         {
-            Interop.Error err = Interop.Sys.IoUringShimEnter(ringFd, toSubmit, minComplete, enterFlags, &result);
+            int localResult;
+            Interop.Error err = Interop.Sys.IoUringShimEnter(ringFd, toSubmit, minComplete, enterFlags, &localResult);
             if (err == Interop.Error.EINVAL && (enterFlags & IoUringConstants.EnterRegisteredRing) != 0)
             {
-                err = IoUringEnterWithFallbackSlow(ref ringFd, toSubmit, minComplete, ref enterFlags, &result);
+                err = IoUringEnterWithFallbackSlow(ref ringFd, toSubmit, minComplete, ref enterFlags, &localResult);
             }
+            result = localResult;
             return err;
         }
 
@@ -4217,11 +4318,13 @@ namespace System.Net.Sockets
             ref int ringFd, uint toSubmit, uint minComplete, ref uint enterFlags,
             Interop.Sys.IoUringGeteventsArg* extArg, out int result)
         {
-            Interop.Error err = Interop.Sys.IoUringShimEnterExt(ringFd, toSubmit, minComplete, enterFlags, extArg, &result);
+            int localResult;
+            Interop.Error err = Interop.Sys.IoUringShimEnterExt(ringFd, toSubmit, minComplete, enterFlags, extArg, &localResult);
             if (err == Interop.Error.EINVAL && (enterFlags & IoUringConstants.EnterRegisteredRing) != 0)
             {
-                err = IoUringEnterExtWithFallbackSlow(ref ringFd, toSubmit, minComplete, ref enterFlags, extArg, &result);
+                err = IoUringEnterExtWithFallbackSlow(ref ringFd, toSubmit, minComplete, ref enterFlags, extArg, &localResult);
             }
+            result = localResult;
             return err;
         }
 
@@ -4330,19 +4433,22 @@ namespace System.Net.Sockets
         /// <summary>Updates pending-submission accounting after an io_uring_enter wait call.</summary>
         private void UpdateManagedPendingSubmissionCountAfterEnter(uint requestedSubmitCount, int enterResult)
         {
-            if (_sqPollEnabled)
+            lock (_sqSubmitLock)
             {
-                // SQPOLL consumes published SQEs asynchronously after wakeup.
-                _ioUringManagedPendingSubmissions = 0;
-                return;
-            }
+                if (_sqPollEnabled)
+                {
+                    // SQPOLL consumes published SQEs asynchronously after wakeup.
+                    _ioUringManagedPendingSubmissions = 0;
+                    return;
+                }
 
-            uint acceptedSubmitCount = ComputeAcceptedSubmissionCount(requestedSubmitCount, enterResult);
-            uint rejectedSubmitCount = requestedSubmitCount - acceptedSubmitCount;
-            Debug.Assert(
-                acceptedSubmitCount + rejectedSubmitCount == requestedSubmitCount,
-                "Partial-submit accounting mismatch in io_uring wait path.");
-            _ioUringManagedPendingSubmissions = rejectedSubmitCount;
+                uint acceptedSubmitCount = ComputeAcceptedSubmissionCount(requestedSubmitCount, enterResult);
+                uint rejectedSubmitCount = requestedSubmitCount - acceptedSubmitCount;
+                Debug.Assert(
+                    acceptedSubmitCount + rejectedSubmitCount == requestedSubmitCount,
+                    "Partial-submit accounting mismatch in io_uring wait path.");
+                _ioUringManagedPendingSubmissions = rejectedSubmitCount;
+            }
         }
 
         /// <summary>Submits the specified number of pending SQEs via io_uring_enter.</summary>
@@ -4357,8 +4463,7 @@ namespace System.Net.Sockets
                 return Interop.Error.SUCCESS;
             }
 
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "ManagedSubmitPendingEntries must only be called from the event loop thread (SINGLE_ISSUER contract).");
+            // io_uring_enter is callable from any thread (no SINGLE_ISSUER).
             if (TryConsumeDebugForcedSubmitError(out Interop.Error forcedSubmitError))
             {
                 return forcedSubmitError;
@@ -4418,11 +4523,13 @@ namespace System.Net.Sockets
         /// <summary>Computes pending submissions and calls ManagedSubmitPendingEntries.</summary>
         private Interop.Error SubmitIoUringOperationsNormalized()
         {
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "SubmitIoUringOperationsNormalized must only be called from the event loop thread (SINGLE_ISSUER contract).");
-            PublishManagedSqeTail();
-            uint managedPending = _ioUringManagedPendingSubmissions;
-            _ioUringManagedPendingSubmissions = 0;
+            uint managedPending;
+            lock (_sqSubmitLock)
+            {
+                PublishManagedSqeTail();
+                managedPending = _ioUringManagedPendingSubmissions;
+                _ioUringManagedPendingSubmissions = 0;
+            }
 
             Interop.Error error = ManagedSubmitPendingEntries(managedPending, out uint acceptedSubmitCount);
             uint rejectedSubmitCount = managedPending - acceptedSubmitCount;

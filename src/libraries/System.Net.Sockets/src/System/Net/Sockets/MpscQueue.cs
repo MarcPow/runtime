@@ -404,13 +404,17 @@ namespace System.Net.Sockets
         private struct PaddedSegment
         {
             internal Segment? Value;
+#pragma warning disable CS0649 // Intentional cache line padding
             internal CacheLinePadding _padding;
+#pragma warning restore CS0649
         }
 
         private struct PaddedInt32
         {
             internal int Value;
+#pragma warning disable CS0649 // Intentional cache line padding
             internal CacheLinePadding _padding;
+#pragma warning restore CS0649
         }
 
     }

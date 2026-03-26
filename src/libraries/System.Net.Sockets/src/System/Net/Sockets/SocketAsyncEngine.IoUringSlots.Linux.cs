@@ -97,8 +97,6 @@ namespace System.Net.Sockets
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void SetCompletionSlotKind(ref IoUringCompletionSlot slot, IoUringCompletionOperationKind kind)
         {
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "SetCompletionSlotKind must run on the event-loop thread.");
             IoUringCompletionOperationKind previousKind = slot.Kind;
             if (previousKind == kind)
             {
@@ -131,12 +129,13 @@ namespace System.Net.Sockets
         /// <summary>
         /// Allocates a completion slot from the free list. Returns the slot index,
         /// or -1 if the pool is exhausted (backpressure signal).
+        /// Caller must hold <see cref="_sqSubmitLock"/>.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int AllocateCompletionSlot()
         {
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "AllocateCompletionSlot must run on the event-loop thread.");
+            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
+                "AllocateCompletionSlot must be called while holding _sqSubmitLock.");
             Debug.Assert(_completionSlots is not null);
             int index = _completionSlotFreeListHead;
             if (index < 0)
@@ -158,11 +157,10 @@ namespace System.Net.Sockets
         /// <summary>
         /// Returns a completion slot to the free list, incrementing its generation
         /// to invalidate any stale user_data references.
+        /// The free-list push at the end is protected by <see cref="_sqSubmitLock"/>.
         /// </summary>
         private unsafe void FreeCompletionSlot(int index)
         {
-            Debug.Assert(IsCurrentThreadEventLoopThread(),
-                "FreeCompletionSlot must run on the event-loop thread.");
             Debug.Assert(index >= 0 && index < _completionSlots!.Length);
 
             ReleaseZeroCopyPinHold(index);
@@ -228,9 +226,14 @@ namespace System.Net.Sockets
                 slot.FixedRecvBufferId = 0;
                 Volatile.Write(ref trackedState.TrackedOperation, null);
                 trackedState.TrackedOperationGeneration = 0;
-                slot.FreeListNext = _completionSlotFreeListHead;
-                _completionSlotFreeListHead = index;
-                _completionSlotsInUse--;
+
+                // Protect free-list manipulation — shared with AllocateCompletionSlot on any thread.
+                lock (_sqSubmitLock)
+                {
+                    slot.FreeListNext = _completionSlotFreeListHead;
+                    _completionSlotFreeListHead = index;
+                    _completionSlotsInUse--;
+                }
             }
 
             dangerousReleaseException?.Throw();
