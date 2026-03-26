@@ -32,7 +32,6 @@ public sealed class ExecutionManager_1 : IExecutionManager
     public CodeHeapType GetCodeHeapType(TargetPointer codeHeapAddress) => _executionManagerCore.GetCodeHeapType(codeHeapAddress);
     public TargetPointer GetLoaderCodeHeapInfo(TargetPointer codeHeapAddress) => _executionManagerCore.GetLoaderCodeHeapInfo(codeHeapAddress);
     public void GetHostCodeHeapInfo(TargetPointer codeHeapAddress, out TargetPointer baseAddress, out TargetPointer currentAddress) => _executionManagerCore.GetHostCodeHeapInfo(codeHeapAddress, out baseAddress, out currentAddress);
-    public TargetPointer GetCodeHeapListNodeNext(TargetPointer nodeAddress) => _executionManagerCore.GetCodeHeapListNodeNext(nodeAddress);
-    public TargetPointer GetCodeHeapListNodeHeap(TargetPointer nodeAddress) => _executionManagerCore.GetCodeHeapListNodeHeap(nodeAddress);
+    public List<TargetPointer> GetCodeHeapList(TargetPointer heapListAddress) => _executionManagerCore.GetCodeHeapList(heapListAddress);
     public void Flush() => _executionManagerCore.Flush();
 }

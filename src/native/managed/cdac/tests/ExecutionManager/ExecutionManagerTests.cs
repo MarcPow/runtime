@@ -537,7 +537,7 @@ public class ExecutionManagerTests
 
     [Theory]
     [MemberData(nameof(StdArchAllVersions))]
-    public void GetCodeHeapListNodeNext_And_Heap(int version, MockTarget.Architecture arch)
+    public void GetCodeHeapList_SingleNode(int version, MockTarget.Architecture arch)
     {
         MockDescriptors.ExecutionManager emBuilder = new(version, arch, MockDescriptors.ExecutionManager.DefaultAllocationRange);
 
@@ -558,13 +558,14 @@ public class ExecutionManagerTests
         var target = CreateTarget(emBuilder);
         var em = target.Contracts.ExecutionManager;
 
-        Assert.Equal(TargetPointer.Null, em.GetCodeHeapListNodeNext(nodeAddr));
-        Assert.Equal(heapAddr, em.GetCodeHeapListNodeHeap(nodeAddr));
+        List<TargetPointer> heaps = em.GetCodeHeapList(nodeAddr);
+        Assert.Single(heaps);
+        Assert.Equal(heapAddr, heaps[0]);
     }
 
     [Theory]
     [MemberData(nameof(StdArchAllVersions))]
-    public void GetCodeHeapListNode_LinkedList_TwoNodes(int version, MockTarget.Architecture arch)
+    public void GetCodeHeapList_LinkedList_TwoNodes(int version, MockTarget.Architecture arch)
     {
         MockDescriptors.ExecutionManager emBuilder = new(version, arch, MockDescriptors.ExecutionManager.DefaultAllocationRange);
 
@@ -601,19 +602,19 @@ public class ExecutionManagerTests
         var target = CreateTarget(emBuilder);
         var em = target.Contracts.ExecutionManager;
 
-        // Verify node1
-        Assert.Equal(node2, em.GetCodeHeapListNodeNext(node1));
-        Assert.Equal(loaderHeap, em.GetCodeHeapListNodeHeap(node1));
-        Assert.Equal(CodeHeapType.LoaderCodeHeap, em.GetCodeHeapType(em.GetCodeHeapListNodeHeap(node1)));
-        TargetPointer loaderHeapAddr = em.GetLoaderCodeHeapInfo(loaderHeap);
-        ulong loaderHeapFieldOffset = (ulong)emBuilder.Types[DataType.LoaderCodeHeap].Fields[nameof(Data.LoaderCodeHeap.LoaderHeap)].Offset;
-        Assert.Equal(new TargetPointer(loaderHeap.Value + loaderHeapFieldOffset), loaderHeapAddr);
+        List<TargetPointer> heaps = em.GetCodeHeapList(node1);
+        Assert.Equal(2, heaps.Count);
 
-        // Verify node2
-        Assert.Equal(TargetPointer.Null, em.GetCodeHeapListNodeNext(node2));
-        Assert.Equal(hostHeap, em.GetCodeHeapListNodeHeap(node2));
-        Assert.Equal(CodeHeapType.HostCodeHeap, em.GetCodeHeapType(em.GetCodeHeapListNodeHeap(node2)));
-        em.GetHostCodeHeapInfo(hostHeap, out TargetPointer gotBase, out TargetPointer gotCurrent);
+        // First heap (from node1) is a LoaderCodeHeap
+        Assert.Equal(loaderHeap, heaps[0]);
+        Assert.Equal(CodeHeapType.LoaderCodeHeap, em.GetCodeHeapType(heaps[0]));
+        ulong loaderHeapFieldOffset = (ulong)emBuilder.Types[DataType.LoaderCodeHeap].Fields[nameof(Data.LoaderCodeHeap.LoaderHeap)].Offset;
+        Assert.Equal(new TargetPointer(loaderHeap.Value + loaderHeapFieldOffset), em.GetLoaderCodeHeapInfo(heaps[0]));
+
+        // Second heap (from node2) is a HostCodeHeap
+        Assert.Equal(hostHeap, heaps[1]);
+        Assert.Equal(CodeHeapType.HostCodeHeap, em.GetCodeHeapType(heaps[1]));
+        em.GetHostCodeHeapInfo(heaps[1], out TargetPointer gotBase, out TargetPointer gotCurrent);
         Assert.Equal(baseAddr, gotBase);
         Assert.Equal(currentAddr, gotCurrent);
     }

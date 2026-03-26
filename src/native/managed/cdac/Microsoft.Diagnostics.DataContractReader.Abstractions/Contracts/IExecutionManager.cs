@@ -69,8 +69,7 @@ public interface IExecutionManager : IContract
     CodeHeapType GetCodeHeapType(TargetPointer codeHeapAddress) => throw new NotImplementedException();
     TargetPointer GetLoaderCodeHeapInfo(TargetPointer codeHeapAddress) => throw new NotImplementedException();
     void GetHostCodeHeapInfo(TargetPointer codeHeapAddress, out TargetPointer baseAddress, out TargetPointer currentAddress) => throw new NotImplementedException();
-    TargetPointer GetCodeHeapListNodeNext(TargetPointer nodeAddress) => throw new NotImplementedException();
-    TargetPointer GetCodeHeapListNodeHeap(TargetPointer nodeAddress) => throw new NotImplementedException();
+    List<TargetPointer> GetCodeHeapList(TargetPointer heapListAddress) => throw new NotImplementedException();
 }
 
 public readonly struct ExecutionManager : IExecutionManager

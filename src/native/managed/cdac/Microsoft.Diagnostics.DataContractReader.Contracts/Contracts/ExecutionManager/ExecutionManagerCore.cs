@@ -407,16 +407,17 @@ internal sealed partial class ExecutionManagerCore<T> : IExecutionManager
         currentAddress = hostCodeHeap.CurrentAddress;
     }
 
-    TargetPointer IExecutionManager.GetCodeHeapListNodeNext(TargetPointer nodeAddress)
+    List<TargetPointer> IExecutionManager.GetCodeHeapList(TargetPointer heapListAddress)
     {
-        Data.CodeHeapListNode node = _target.ProcessedData.GetOrAdd<Data.CodeHeapListNode>(nodeAddress);
-        return node.Next;
-    }
-
-    TargetPointer IExecutionManager.GetCodeHeapListNodeHeap(TargetPointer nodeAddress)
-    {
-        Data.CodeHeapListNode node = _target.ProcessedData.GetOrAdd<Data.CodeHeapListNode>(nodeAddress);
-        return node.Heap;
+        List<TargetPointer> result = [];
+        TargetPointer nodeAddr = heapListAddress;
+        while (nodeAddr != TargetPointer.Null)
+        {
+            Data.CodeHeapListNode node = _target.ProcessedData.GetOrAdd<Data.CodeHeapListNode>(nodeAddr);
+            result.Add(node.Heap);
+            nodeAddr = node.Next;
+        }
+        return result;
     }
 
     private RangeSection RangeSectionFromCodeBlockHandle(CodeBlockHandle codeInfoHandle)

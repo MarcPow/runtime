@@ -862,76 +862,53 @@ public sealed unsafe partial class SOSDacImpl
 #endif
         return hr;
     }
-    int ISOSDacInterface.GetCodeHeapList(ClrDataAddress jitManager, uint count, void* codeHeaps, uint* pNeeded)
+    int ISOSDacInterface.GetCodeHeapList(ClrDataAddress jitManager, uint count, DacpJitCodeHeapInfo[]? codeHeaps, uint* pNeeded)
     {
-        if (jitManager == 0)
-            return HResults.E_INVALIDARG;
-
         int hr = HResults.S_OK;
         try
         {
-            DacpJitCodeHeapInfo* heapInfos = (DacpJitCodeHeapInfo*)codeHeaps;
-            Contracts.IExecutionManager em = _target.Contracts.ExecutionManager;
+            if (jitManager == 0)
+                throw new ArgumentException();
 
-            // GetEEJitManagerInfo uses a global pointer; we need the jitManager address directly.
-            // Use the JitManagerInfo.HeapListAddress only when jitManager matches the known manager.
-            // Here the caller already passes the manager address, so read AllCodeHeaps via the contract.
+            Contracts.IExecutionManager em = _target.Contracts.ExecutionManager;
             Contracts.JitManagerInfo jitManagerInfo = em.GetEEJitManagerInfo();
-            TargetPointer heapListHead = (jitManagerInfo.ManagerAddress == jitManager.ToTargetPointer(_target))
+            TargetPointer heapListHead = jitManagerInfo.ManagerAddress == jitManager.ToTargetPointer(_target)
                 ? jitManagerInfo.HeapListAddress
                 : TargetPointer.Null;
 
-            if (heapInfos is not null)
+            List<TargetPointer> heaps = em.GetCodeHeapList(heapListHead);
+            uint n = 0;
+            if (codeHeaps is not null)
             {
-                uint i = 0;
-                TargetPointer nodeAddr = heapListHead;
-                while (nodeAddr != TargetPointer.Null && i < count)
+                for (; n < (uint)heaps.Count && n < (uint)codeHeaps.Length; n++)
                 {
-                    heapInfos[i] = default;
-                    TargetPointer heap = em.GetCodeHeapListNodeHeap(nodeAddr);
-                    if (heap != TargetPointer.Null)
+                    codeHeaps[n] = default;
+                    TargetPointer heap = heaps[(int)n];
+                    switch (em.GetCodeHeapType(heap))
                     {
-                        Contracts.CodeHeapType heapType = em.GetCodeHeapType(heap);
-                        switch (heapType)
-                        {
-                            case Contracts.CodeHeapType.LoaderCodeHeap:
-                                heapInfos[i].codeHeapType = 0; // CODEHEAP_LOADER
-                                TargetPointer loaderHeap = em.GetLoaderCodeHeapInfo(heap);
-                                heapInfos[i].LoaderHeap = loaderHeap.ToClrDataAddress(_target);
-                                break;
-                            case Contracts.CodeHeapType.HostCodeHeap:
-                                heapInfos[i].codeHeapType = 1; // CODEHEAP_HOST
-                                em.GetHostCodeHeapInfo(heap, out TargetPointer baseAddr, out TargetPointer currentAddr);
-                                heapInfos[i].baseAddr    = baseAddr.ToClrDataAddress(_target);
-                                heapInfos[i].currentAddr = currentAddr.ToClrDataAddress(_target);
-                                break;
-                            default:
-                                heapInfos[i].codeHeapType = unchecked((int)0xff); // CODEHEAP_UNKNOWN
-                                break;
-                        }
+                        case Contracts.CodeHeapType.LoaderCodeHeap:
+                            codeHeaps[n].codeHeapType = 0; // CODEHEAP_LOADER
+                            codeHeaps[n].LoaderHeap = em.GetLoaderCodeHeapInfo(heap).ToClrDataAddress(_target);
+                            break;
+                        case Contracts.CodeHeapType.HostCodeHeap:
+                            codeHeaps[n].codeHeapType = 1; // CODEHEAP_HOST
+                            em.GetHostCodeHeapInfo(heap, out TargetPointer baseAddr, out TargetPointer currentAddr);
+                            codeHeaps[n].baseAddr    = baseAddr.ToClrDataAddress(_target);
+                            codeHeaps[n].currentAddr = currentAddr.ToClrDataAddress(_target);
+                            break;
+                        default:
+                            codeHeaps[n].codeHeapType = unchecked((int)0xff); // CODEHEAP_UNKNOWN
+                            break;
                     }
-                    nodeAddr = em.GetCodeHeapListNodeNext(nodeAddr);
-                    i++;
                 }
-
-                if (pNeeded is not null)
-                    *pNeeded = i;
-            }
-            else if (pNeeded is not null)
-            {
-                uint count2 = 0;
-                TargetPointer nodeAddr = heapListHead;
-                while (nodeAddr != TargetPointer.Null)
-                {
-                    nodeAddr = em.GetCodeHeapListNodeNext(nodeAddr);
-                    count2++;
-                }
-                *pNeeded = count2;
             }
             else
             {
-                hr = HResults.E_INVALIDARG;
+                n = (uint)heaps.Count;
             }
+
+            if (pNeeded is not null)
+                *pNeeded = n;
         }
         catch (System.Exception ex)
         {
@@ -940,51 +917,29 @@ public sealed unsafe partial class SOSDacImpl
 #if DEBUG
         if (_legacyImpl is not null)
         {
-            DacpJitCodeHeapInfo* heapInfos = (DacpJitCodeHeapInfo*)codeHeaps;
-            if (heapInfos is not null)
+            uint neededLocal = 0;
+            DacpJitCodeHeapInfo[]? legacyHeaps = codeHeaps is not null ? new DacpJitCodeHeapInfo[count] : null;
+            int hrLocal = _legacyImpl.GetCodeHeapList(jitManager, count, legacyHeaps, &neededLocal);
+            Debug.ValidateHResult(hr, hrLocal);
+            if (hr == HResults.S_OK && pNeeded is not null)
+                Debug.Assert(*pNeeded == neededLocal, $"cDAC: {*pNeeded}, DAC: {neededLocal}");
+            if (hr == HResults.S_OK && hrLocal == HResults.S_OK && codeHeaps is not null && pNeeded is not null)
             {
-                if (pNeeded is not null)
+                for (uint i = 0; i < *pNeeded; i++)
                 {
-                    uint neededLocal = 0;
-                    int hrLocal = _legacyImpl.GetCodeHeapList(jitManager, count, null, &neededLocal);
-                    Debug.ValidateHResult(hr, hrLocal);
-                    if (hr == HResults.S_OK)
-                        Debug.Assert(*pNeeded == neededLocal, $"cDAC: {*pNeeded}, DAC: {neededLocal}");
-                }
-                if (hr == HResults.S_OK && count > 0 && pNeeded is not null)
-                {
-                    DacpJitCodeHeapInfo* legacyHeaps = stackalloc DacpJitCodeHeapInfo[(int)count];
-                    int hrLocal = _legacyImpl.GetCodeHeapList(jitManager, count, legacyHeaps, null);
-                    Debug.ValidateHResult(hr, hrLocal);
-                    if (hrLocal == HResults.S_OK)
+                    Debug.Assert(codeHeaps[i].codeHeapType == legacyHeaps![i].codeHeapType,
+                        $"cDAC heap[{i}] type: {codeHeaps[i].codeHeapType}, DAC: {legacyHeaps[i].codeHeapType}");
+                    if (codeHeaps[i].codeHeapType == 0) // CODEHEAP_LOADER
+                        Debug.Assert(codeHeaps[i].LoaderHeap == legacyHeaps[i].LoaderHeap,
+                            $"cDAC heap[{i}] LoaderHeap: {codeHeaps[i].LoaderHeap:x}, DAC: {legacyHeaps[i].LoaderHeap:x}");
+                    else if (codeHeaps[i].codeHeapType == 1) // CODEHEAP_HOST
                     {
-                        for (uint i = 0; i < *pNeeded; i++)
-                        {
-                            Debug.Assert(heapInfos[i].codeHeapType == legacyHeaps[i].codeHeapType,
-                                $"cDAC heap[{i}] type: {heapInfos[i].codeHeapType}, DAC: {legacyHeaps[i].codeHeapType}");
-                            if (heapInfos[i].codeHeapType == 0) // CODEHEAP_LOADER
-                            {
-                                Debug.Assert(heapInfos[i].LoaderHeap == legacyHeaps[i].LoaderHeap,
-                                    $"cDAC heap[{i}] LoaderHeap: {heapInfos[i].LoaderHeap:x}, DAC: {legacyHeaps[i].LoaderHeap:x}");
-                            }
-                            else if (heapInfos[i].codeHeapType == 1) // CODEHEAP_HOST
-                            {
-                                Debug.Assert(heapInfos[i].baseAddr == legacyHeaps[i].baseAddr,
-                                    $"cDAC heap[{i}] baseAddr: {heapInfos[i].baseAddr:x}, DAC: {legacyHeaps[i].baseAddr:x}");
-                                Debug.Assert(heapInfos[i].currentAddr == legacyHeaps[i].currentAddr,
-                                    $"cDAC heap[{i}] currentAddr: {heapInfos[i].currentAddr:x}, DAC: {legacyHeaps[i].currentAddr:x}");
-                            }
-                        }
+                        Debug.Assert(codeHeaps[i].baseAddr == legacyHeaps[i].baseAddr,
+                            $"cDAC heap[{i}] baseAddr: {codeHeaps[i].baseAddr:x}, DAC: {legacyHeaps[i].baseAddr:x}");
+                        Debug.Assert(codeHeaps[i].currentAddr == legacyHeaps[i].currentAddr,
+                            $"cDAC heap[{i}] currentAddr: {codeHeaps[i].currentAddr:x}, DAC: {legacyHeaps[i].currentAddr:x}");
                     }
                 }
-            }
-            else if (pNeeded is not null)
-            {
-                uint neededLocal = 0;
-                int hrLocal = _legacyImpl.GetCodeHeapList(jitManager, 0, null, &neededLocal);
-                Debug.ValidateHResult(hr, hrLocal);
-                if (hr == HResults.S_OK)
-                    Debug.Assert(*pNeeded == neededLocal, $"cDAC: {*pNeeded}, DAC: {neededLocal}");
             }
         }
 #endif
