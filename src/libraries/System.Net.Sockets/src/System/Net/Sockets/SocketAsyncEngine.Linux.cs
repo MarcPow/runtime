@@ -2923,21 +2923,15 @@ namespace System.Net.Sockets
             setupResult = default;
             uint queueEntries = GetIoUringQueueEntries();
 
-            // SINGLE_ISSUER + DEFER_TASKRUN restored: the direct-submit path acquires
-            // _sqSubmitLock but all SQE writes and io_uring_enter calls still happen on
-            // the event loop thread (via the MPSC queue). Multi-thread submission will be
-            // re-enabled once the event loop completion wait is adapted for COOP_TASKRUN.
+            // Multi-thread submission: any thread can write SQEs and call io_uring_enter.
+            // SINGLE_ISSUER and DEFER_TASKRUN are intentionally omitted.
             uint flags = IoUringConstants.SetupCqSize | IoUringConstants.SetupSubmitAll
-                       | IoUringConstants.SetupCoopTaskrun | IoUringConstants.SetupSingleIssuer
+                       | IoUringConstants.SetupCoopTaskrun
                        | IoUringConstants.SetupNoSqArray | IoUringConstants.SetupCloexec;
 
             if (sqPollRequested)
             {
                 flags |= IoUringConstants.SetupSqPoll;
-            }
-            else
-            {
-                flags |= IoUringConstants.SetupDeferTaskrun;
             }
 
             // Peel unsupported setup flags on EINVAL and retry, newest first.
@@ -3242,11 +3236,8 @@ namespace System.Net.Sockets
             // Managed CQE drain path: read CQEs directly from mmap'd ring.
             // First, try a non-blocking drain of any already-available CQEs.
             bool hadCqes = DrainCqeRingBatch(handler);
-            bool deferTaskrunEnabled =
-                (_ringState.NegotiatedFlags & IoUringConstants.SetupDeferTaskrun) != 0;
-            bool forceDeferredTaskWorkEnter = hadCqes && deferTaskrunEnabled;
 
-            // Drain the MPSC queues (prepare + cancel).
+            // Drain the MPSC fallback queues (only populated when direct submit fails).
             if (Volatile.Read(ref _ioUringPrepareQueueLength) != 0 ||
                 Volatile.Read(ref _ioUringCancelQueueLength) != 0)
             {
@@ -3264,7 +3255,7 @@ namespace System.Net.Sockets
             {
                 submitCount = _sqPollEnabled ? 0u : _ioUringManagedPendingSubmissions;
             }
-            if (hadCqes && !forceDeferredTaskWorkEnter && submitCount == 0)
+            if (hadCqes && submitCount == 0)
             {
                 numCompletions = 1;
                 numEvents = 0;
@@ -3273,10 +3264,8 @@ namespace System.Net.Sockets
                 return;
             }
 
-            // If CQEs were already drained and DEFER_TASKRUN is active, perform a non-blocking
-            // io_uring_enter(GETEVENTS, minComplete=0) to flush deferred task work.
-            // Otherwise perform the regular bounded wait for at least one CQE.
-            uint minComplete = (forceDeferredTaskWorkEnter || hadCqes) ? 0u : 1u;
+            // No DEFER_TASKRUN: wait for at least one CQE, or non-blocking if CQEs already drained.
+            uint minComplete = hadCqes ? 0u : 1u;
             uint enterFlags = IoUringConstants.EnterGetevents;
             int ringFd = 0;
             ResolveRingFd(ref ringFd, ref enterFlags);

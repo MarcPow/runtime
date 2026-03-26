@@ -820,8 +820,17 @@ namespace System.Net.Sockets
                 operation.IoUringUserData == 0 &&
                 operation.IsInWaitingState())
             {
-                // TODO: Re-enable direct-submit fast path after MPSC baseline is verified.
-                // Direct-submit disabled to isolate whether hang is from SINGLE_ISSUER removal.
+                SocketAsyncContext context = operation.AssociatedContext;
+                SocketAsyncEngine? engine = Volatile.Read(ref context._asyncEngine);
+                if (engine is not null && engine.IsIoUringDirectSqeEnabled)
+                {
+                    if (operation.TryDirectSubmitIoUring(context, engine))
+                    {
+                        return;
+                    }
+                }
+
+                // Slow path: SQ ring full or slot exhaustion — fall back to MPSC queue.
                 if (!operation.TryQueueIoUringPreparation())
                 {
                     operation.EmitReadinessFallbackForQueueOverflow();
