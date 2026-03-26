@@ -419,7 +419,9 @@ namespace System.Net.Sockets
             internal const int MinKernelMinor = 1;
 
             // Zero-copy send size threshold (payloads below this use regular send).
-            internal const int ZeroCopySendThreshold = 16384; // 16KB
+            // Disabled: SEND_ZC NOTIF CQE handling has a bug that causes EINVAL after ~40
+            // sequential large sends. Regular SEND works correctly for all sizes.
+            internal const int ZeroCopySendThreshold = int.MaxValue;
 
             // User data tag values (encoded in upper bits of user_data)
             internal const byte TagNone               = 0;
