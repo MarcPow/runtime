@@ -384,7 +384,11 @@ namespace System.Net.Sockets
             internal const uint CqeFNotif = 1u << 3; // IORING_CQE_F_NOTIF (zero-copy notification)
             internal const int CqeBufferShift = 16; // IORING_CQE_BUFFER_SHIFT
 
-            // Recv ioprio flags
+            // Send/Recv ioprio flags
+            // IORING_RECVSEND_POLL_FIRST: skip the initial non-blocking attempt and go
+            // straight to kernel-internal FAST_POLL. This avoids EAGAIN for O_NONBLOCK sockets
+            // and eliminates the need for userspace EAGAIN retry logic. (Linux 5.19+)
+            internal const ushort RecvSendPollFirst = 1 << 0; // IORING_RECVSEND_POLL_FIRST
             internal const ushort RecvMultishot = 1 << 1; // IORING_RECV_MULTISHOT
             // Accept ioprio flags
             internal const ushort AcceptMultishot = 1 << 0; // IORING_ACCEPT_MULTISHOT
@@ -2393,6 +2397,18 @@ namespace System.Net.Sockets
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal Lock GetSqSubmitLock() => _sqSubmitLock;
 
+        /// <summary>
+        /// Submits pending SQEs to the kernel via io_uring_enter.
+        /// Callable from any thread (no SINGLE_ISSUER).
+        /// </summary>
+        internal void SubmitPendingToKernel(uint toSubmit)
+        {
+            if (toSubmit == 0) return;
+            uint enterFlags = 0;
+            int ringFd = _ringState.RingFd;
+            IoUringEnterWithFallback(ref ringFd, toSubmit, 0, ref enterFlags, out _);
+        }
+
         internal void AbortDirectSqeSubmission(Lock heldSqLock, int slotIndex, SafeSocketHandle socket)
         {
             Debug.Assert(heldSqLock.IsHeldByCurrentThread);
@@ -2440,18 +2456,6 @@ namespace System.Net.Sockets
             return false;
         }
 
-        /// <summary>
-        /// Submits pending SQEs to the kernel via io_uring_enter.
-        /// Callable from any thread (no SINGLE_ISSUER).
-        /// </summary>
-        internal void SubmitPendingToKernel(uint toSubmit)
-        {
-            if (toSubmit == 0) return;
-            uint enterFlags = 0;
-            int ringFd = _ringState.RingFd;
-            // io_uring_enter is safe from any thread without SINGLE_ISSUER.
-            IoUringEnterWithFallback(ref ringFd, toSubmit, 0, ref enterFlags, out _);
-        }
 
         /// <summary>
         /// Prepares a send SQE, preferring SEND_ZC when eligible and falling back to SEND when unavailable.

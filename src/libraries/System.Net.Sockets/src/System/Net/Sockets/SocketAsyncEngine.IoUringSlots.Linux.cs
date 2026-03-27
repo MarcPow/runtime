@@ -213,23 +213,23 @@ namespace System.Net.Sockets
                     slotStorage.ReusePortPrimaryEngine = null;
                 }
 
-                slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
-                if (slot.Generation == 0)
-                {
-                    slot.Generation = 1;
-                }
-                SetCompletionSlotKind(ref slot, IoUringCompletionOperationKind.None);
-                ResetDebugTestForcedResult(ref slot);
-                slot.ClearZeroCopyState();
-                slot.UsesFixedRecvBuffer = false;
-                slot.FixedRecvBufferId = 0;
-                Volatile.Write(ref trackedState.TrackedOperation, null);
-                trackedState.TrackedOperationGeneration = 0;
-
-                // Protect free-list manipulation — shared with AllocateCompletionSlot on any thread.
+                // Lock covers generation bump + state reset + free-list push atomically.
+                // Without this, a user thread could AllocateCompletionSlot between the
+                // generation bump and the free-list push, seeing a stale generation.
                 lock (_sqSubmitLock)
                 {
-                    // Lock is held via lock() statement above
+                    slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
+                    if (slot.Generation == 0)
+                    {
+                        slot.Generation = 1;
+                    }
+                    SetCompletionSlotKind(ref slot, IoUringCompletionOperationKind.None);
+                    ResetDebugTestForcedResult(ref slot);
+                    slot.ClearZeroCopyState();
+                    slot.UsesFixedRecvBuffer = false;
+                    slot.FixedRecvBufferId = 0;
+                    Volatile.Write(ref trackedState.TrackedOperation, null);
+                    trackedState.TrackedOperationGeneration = 0;
                     slot.FreeListNext = _completionSlotFreeListHead;
                     _completionSlotFreeListHead = index;
                     _completionSlotsInUse--;

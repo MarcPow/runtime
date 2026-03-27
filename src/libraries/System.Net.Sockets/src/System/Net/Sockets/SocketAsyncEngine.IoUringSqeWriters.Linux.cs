@@ -40,7 +40,7 @@ namespace System.Net.Sockets
         {
             sqe->Opcode = opcode;
             sqe->Flags = sqeFlags;
-            sqe->Ioprio = 0; // Not used by send/recv opcodes.
+            sqe->Ioprio = IoUringConstants.RecvSendPollFirst; // Kernel handles EAGAIN via FAST_POLL
             sqe->Fd = sqeFd;
             sqe->Off = 0; // Not used by send/recv opcodes.
             sqe->Addr = (ulong)(nuint)buffer;
@@ -78,6 +78,7 @@ namespace System.Net.Sockets
         /// Writes a recv SQE using provided-buffer selection (one-shot or multishot).
         /// The kernel chooses a buffer from the specified buffer group.
         /// For multishot, set <paramref name="ioprio"/> to <see cref="IoUringConstants.RecvMultishot"/>.
+        /// POLL_FIRST is always OR'd in so the kernel handles EAGAIN via FAST_POLL.
         /// </summary>
         private static void WriteProvidedBufferRecvSqe(
             IoUringSqe* sqe,
@@ -92,7 +93,7 @@ namespace System.Net.Sockets
             sqe->Opcode = IoUringOpcodes.Recv;
             sqe->Flags = (byte)(sqeFlags | IoUringConstants.SqeBufferSelect);
             sqe->Fd = sqeFd;
-            sqe->Ioprio = ioprio;
+            sqe->Ioprio = (ushort)(ioprio | IoUringConstants.RecvSendPollFirst);
             sqe->Off = 0; // Not used by provided-buffer recv.
             sqe->Addr = 0; // No user buffer; kernel selects from buffer group.
             sqe->Len = requestedLength;
@@ -140,7 +141,7 @@ namespace System.Net.Sockets
         {
             sqe->Opcode = opcode;
             sqe->Flags = sqeFlags;
-            sqe->Ioprio = 0; // Not used by sendmsg/recvmsg.
+            sqe->Ioprio = IoUringConstants.RecvSendPollFirst; // Kernel handles EAGAIN via FAST_POLL
             sqe->Fd = sqeFd;
             sqe->Off = 0; // Not used by sendmsg/recvmsg.
             sqe->Addr = (ulong)(nuint)messageHeader;
