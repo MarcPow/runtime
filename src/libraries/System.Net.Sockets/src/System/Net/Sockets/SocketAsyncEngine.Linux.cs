@@ -3435,20 +3435,14 @@ namespace System.Net.Sockets
                 return false;
             }
 
-            long queueLength = Interlocked.Increment(ref _ioUringPrepareQueueLength);
-            if (queueLength > s_ioUringPrepareQueueCapacity)
-            {
-                Interlocked.Decrement(ref _ioUringPrepareQueueLength);
-                Interlocked.Increment(ref _ioUringPrepareQueueOverflowCount);
-
-                return false;
-            }
+            // No capacity limit — rejecting an enqueue silently drops the operation,
+            // causing the caller's await to hang forever. The queue is self-limiting
+            // because each producer awaits its previous operation before submitting the next.
+            Interlocked.Increment(ref _ioUringPrepareQueueLength);
 
             if (!prepareQueue.TryEnqueue(new IoUringPrepareWorkItem(operation, prepareSequence)))
             {
                 Interlocked.Decrement(ref _ioUringPrepareQueueLength);
-                Interlocked.Increment(ref _ioUringPrepareQueueOverflowCount);
-
                 return false;
             }
 
