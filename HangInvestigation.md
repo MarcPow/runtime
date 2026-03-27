@@ -151,6 +151,93 @@ permanent hangs.
 
 `MarcPow/runtime` branch `fix/iouring-direct-submit-perf`
 
+## Reproduction Test Code
+
+```csharp
+// /tmp/diag2/Program.cs on Azure VMs
+// Tests concurrent send + recv on same TCP socket at various counts
+using System; using System.Net; using System.Net.Sockets;
+using System.Threading; using System.Threading.Tasks; using System.Diagnostics;
+
+foreach (int count in new[] { 50, 60, 70, 80, 90, 100, 150, 200 })
+{
+    var l = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+    l.Bind(new IPEndPoint(IPAddress.Loopback, 0)); l.Listen(1);
+    var c = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+    c.NoDelay = true;
+    await c.ConnectAsync((IPEndPoint)l.LocalEndPoint!);
+    var s = await l.AcceptAsync(); s.NoDelay = true;
+    byte[] buf = new byte[4096], rb = new byte[65536];
+    long totalBytes = (long)count * buf.Length;
+    int recvCalls = 0;
+    var recv = Task.Run(async () => {
+        long r = 0;
+        while (r < totalBytes) {
+            Interlocked.Increment(ref recvCalls);
+            int n = await s.ReceiveAsync(rb);
+            if (n == 0) break;
+            r += n;
+        }
+        return r;
+    });
+    var sw = Stopwatch.StartNew();
+    for (int i = 0; i < count; i++) await c.SendAsync(buf);
+    if (await Task.WhenAny(recv, Task.Delay(3000)) == recv)
+        Console.WriteLine($"  {count,5} x 4KB: {sw.ElapsedMilliseconds,5}ms OK (recvCalls={recvCalls})");
+    else
+        Console.WriteLine($"  {count,5} x 4KB: TIMEOUT (recvCalls={recvCalls})");
+    c.Dispose(); s.Dispose(); l.Dispose();
+}
+```
+
+### Typical failure output (7/10 fail):
+```
+Run 1:      80 x 4KB: TIMEOUT (recvCalls=67)
+Run 2:      80 x 4KB:    15ms OK
+Run 3:      80 x 4KB: TIMEOUT (recvCalls=80)
+Run 4:      80 x 4KB: TIMEOUT (recvCalls=69)
+Run 5:      80 x 4KB: TIMEOUT (recvCalls=72)
+Run 6:      80 x 4KB: TIMEOUT (recvCalls=79)
+Run 7:      80 x 4KB:    16ms OK
+```
+
+Key observation: `recvCalls=80` means all recv calls were MADE but the last never returned.
+`recvCalls=67` means the 67th recv returned but the 68th was never started (the 67th
+completion dispatch didn't resume the receiver's await).
+
+### Key behavior:
+- Sequential send-then-recv: ALWAYS works
+- Concurrent send+recv with 4KB recv buffer: ALWAYS works
+- Concurrent send+recv with 65KB recv buffer: FAILS at ~70-80 ops (~50% repro rate)
+- Under strace: ALWAYS works (0/20 fail) — Heisenbug
+- 4KB recv buffer works because each recv returns exactly one chunk (no partial reads)
+- 65KB recv buffer fails because recv returns variable amounts, creating EAGAIN paths
+
+## Experiments Tried
+
+| Change | Result |
+|--------|--------|
+| Widened `_sqSubmitLock` in `FreeCompletionSlot` (generation bump + state reset under lock) | 20/20 then 3/10 — inconsistent, not the root cause |
+| `IORING_RECVSEND_POLL_FIRST` on all SQEs | No change — still fails at same rate |
+| POLL_ADD for EAGAIN retry (one-shot read, multi-shot write) | No change — still fails |
+| Unbounded MPSC prepare queue | Prevented silent drops, didn't fix throughput hang |
+| strace from start | Always passes — Heisenbug disappears under observation |
+
+## MPSC-only result: 0/10 pass — bug is in the ORIGINAL PR
+
+Disabling direct-submit (forcing all ops through the MPSC queue → event loop) does NOT
+fix the hang. **0/10 pass at 80 x 4KB.** This means the bug is in the original PR's
+completion dispatch or EAGAIN retry logic, not in our multi-thread submission changes.
+
+Our direct-submit optimization is not the cause. The original PR simply doesn't handle
+concurrent send+recv on the same socket with large recv buffers correctly.
+
+## Currently investigating
+
+If the hang disappears with MPSC-only, the root cause is in the direct-submit path's
+multi-thread interaction with the event loop. If it persists, the bug is in the original
+PR's CQE dispatch or completion tracking.
+
 ## Test Infrastructure
 
 - Azure VM (20.12.235.226): 2-core, Ubuntu 24.04, kernel 6.17 — primary test bed

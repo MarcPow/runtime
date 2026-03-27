@@ -1776,6 +1776,18 @@ namespace System.Net.Sockets
                 // WASI sockets are always non-blocking, because in ST we don't have another thread which could be blocked
                 return;
             }
+
+            // When io_uring completion mode is active, keep sockets BLOCKING.
+            // The kernel's FAST_POLL (IORING_FEAT_FAST_POLL) handles async waiting
+            // internally for blocking sockets — if an operation would block, the kernel
+            // arms an internal poll and re-executes when the socket is ready. Userspace
+            // never sees EAGAIN, eliminating the need for retry logic.
+            // O_NONBLOCK is only needed for the epoll path.
+            if (IsIoUringCompletionModeEnabled())
+            {
+                return;
+            }
+
             //
             // Our sockets may start as blocking, and later transition to non-blocking, either because the user
             // explicitly requested non-blocking mode, or because we need non-blocking mode to support async
