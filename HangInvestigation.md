@@ -232,6 +232,15 @@ completion dispatch or EAGAIN retry logic, not in our multi-thread submission ch
 Our direct-submit optimization is not the cause. The original PR simply doesn't handle
 concurrent send+recv on the same socket with large recv buffers correctly.
 
+## Blocking sockets result: 3/5 pass, 2/5 fail — EAGAIN is NOT the cause
+
+Keeping sockets blocking (no O_NONBLOCK) + skipping the sync try (IsReady returns false)
+does NOT fix the hang. The kernel's FAST_POLL should handle all waiting internally —
+EAGAIN never reaches userspace. Yet the hang persists.
+
+**This proves the bug is NOT in the EAGAIN retry path.** It's in the completion dispatch:
+a CQE arrives but the completion callback is never invoked for the waiting async operation.
+
 ## Currently investigating
 
 If the hang disappears with MPSC-only, the root cause is in the direct-submit path's

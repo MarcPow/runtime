@@ -1950,7 +1950,10 @@ namespace System.Net.Sockets
                 Offset += sent;
                 Count -= sent;
                 ErrorCode = SocketError.Success;
-                return Count == 0;
+                // Always report completion — even for partial sends. The caller (Socket.SendAsync)
+                // handles partial results by retrying. Returning false would trigger the io_uring
+                // retry path which blocks on blocking sockets (FAST_POLL mode).
+                return true;
             }
         }
 
