@@ -132,10 +132,9 @@ namespace System.Net.Sockets
         /// Caller must hold <see cref="_sqSubmitLock"/>.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int AllocateCompletionSlot()
+        private int AllocateCompletionSlot(Lock heldSqLock)
         {
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
-                "AllocateCompletionSlot must be called while holding _sqSubmitLock.");
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             Debug.Assert(_completionSlots is not null);
             int index = _completionSlotFreeListHead;
             if (index < 0)
@@ -230,6 +229,7 @@ namespace System.Net.Sockets
                 // Protect free-list manipulation — shared with AllocateCompletionSlot on any thread.
                 lock (_sqSubmitLock)
                 {
+                    // Lock is held via lock() statement above
                     slot.FreeListNext = _completionSlotFreeListHead;
                     _completionSlotFreeListHead = index;
                     _completionSlotsInUse--;

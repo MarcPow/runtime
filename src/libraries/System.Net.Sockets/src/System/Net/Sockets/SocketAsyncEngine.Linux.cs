@@ -2047,15 +2047,14 @@ namespace System.Net.Sockets
         /// <summary>Publishes the managed SQ tail pointer to make queued SQEs visible to the kernel.
         /// Caller must hold <see cref="_sqSubmitLock"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe void PublishManagedSqeTail()
+        private unsafe void PublishManagedSqeTail(Lock heldSqLock)
         {
             if (!_ioUringManagedSqTailLoaded || _ioUringSqRingInfo.SqTailPtr == IntPtr.Zero)
             {
                 return;
             }
 
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
-                "PublishManagedSqeTail must be called while holding _sqSubmitLock.");
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             ref uint sqTailRef = ref Unsafe.AsRef<uint>((void*)_ioUringSqRingInfo.SqTailPtr);
             Volatile.Write(ref sqTailRef, _ioUringManagedSqTail);
             _ioUringManagedSqTailLoaded = false;
@@ -2079,7 +2078,7 @@ namespace System.Net.Sockets
         /// <summary>Allocates the next available SQE slot from the submission ring.
         /// Caller must hold <see cref="_sqSubmitLock"/>.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe bool TryGetNextManagedSqe(out IoUringSqe* sqe)
+        private unsafe bool TryGetNextManagedSqe(Lock heldSqLock, out IoUringSqe* sqe)
         {
             sqe = null;
             if (!_ioUringDirectSqeEnabled)
@@ -2087,8 +2086,7 @@ namespace System.Net.Sockets
                 return false;
             }
 
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread,
-                "TryGetNextManagedSqe must be called while holding _sqSubmitLock.");
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             if (!_managedSqeInvariantsValidated)
             {
                 return false;
@@ -2163,7 +2161,7 @@ namespace System.Net.Sockets
             for (int attempt = 0; attempt < MaxIoUringSqeAcquireSubmitAttempts; attempt++)
             {
                 _sqSubmitLock.Enter();
-                if (TryGetNextManagedSqe(out sqe))
+                if (TryGetNextManagedSqe(_sqSubmitLock, out sqe))
                 {
                     // Lock held — caller writes SQE, then calls FinishDirectSqeSubmission to publish + release.
                     return true;
@@ -2185,7 +2183,7 @@ namespace System.Net.Sockets
                     _ = DrainCqeRingBatch(drainHandler);
 
                     _sqSubmitLock.Enter();
-                    if (TryGetNextManagedSqe(out sqe))
+                    if (TryGetNextManagedSqe(_sqSubmitLock, out sqe))
                     {
                         return true;
                     }
@@ -2231,9 +2229,12 @@ namespace System.Net.Sockets
         /// or a terminal result (Unsupported/PrepareFailed) that the caller should return directly.
         /// </returns>
         private unsafe IoUringDirectSqeSetupResult TrySetupDirectSqe(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             byte opcode)
         {
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
+
             IoUringDirectSqeSetupResult setup = default;
             setup.SlotIndex = -1;
             setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
@@ -2244,15 +2245,10 @@ namespace System.Net.Sockets
                 return setup;
             }
 
-            // Acquire lock for slot allocation + SQE acquisition.
-            // Lock is held through SQE write and released by FinishDirectSqeSubmission.
-            _sqSubmitLock.Enter();
-
-            int slotIndex = AllocateCompletionSlot();
+            int slotIndex = AllocateCompletionSlot(heldSqLock);
             if (slotIndex < 0)
             {
                 Interlocked.Increment(ref _ioUringCompletionSlotExhaustionCount);
-                _sqSubmitLock.Exit();
                 return setup;
             }
 
@@ -2269,8 +2265,7 @@ namespace System.Net.Sockets
             }
             catch (ObjectDisposedException)
             {
-                FreeCompletionSlotUnderLock(slotIndex);
-                _sqSubmitLock.Exit();
+                FreeCompletionSlotUnderLock(heldSqLock, slotIndex);
                 setup.SlotIndex = -1;
                 setup.ErrorCode = SocketError.OperationAborted;
                 setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.PrepareFailed;
@@ -2279,8 +2274,7 @@ namespace System.Net.Sockets
 
             if (!addedSocketRef)
             {
-                FreeCompletionSlotUnderLock(slotIndex);
-                _sqSubmitLock.Exit();
+                FreeCompletionSlotUnderLock(heldSqLock, slotIndex);
                 setup.SlotIndex = -1;
                 setup.ErrorCode = SocketError.OperationAborted;
                 setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.PrepareFailed;
@@ -2295,14 +2289,13 @@ namespace System.Net.Sockets
             setup.SqeFlags = 0;
             ApplyDebugTestForcedResult(ref slot, opcode);
 
-            if (!TryGetNextManagedSqe(out IoUringSqe* sqe))
+            if (!TryGetNextManagedSqe(heldSqLock, out IoUringSqe* sqe))
             {
                 RestoreDebugTestForcedResultIfNeeded(slotIndex, opcode);
                 // Release socket ref before freeing slot (slot free also releases, avoid double-release)
                 slotStorage.DangerousRefSocketHandle = null;
                 socket.DangerousRelease();
-                FreeCompletionSlotUnderLock(slotIndex);
-                _sqSubmitLock.Exit();
+                FreeCompletionSlotUnderLock(heldSqLock, slotIndex);
                 setup.SlotIndex = -1;
                 return setup;
             }
@@ -2317,9 +2310,9 @@ namespace System.Net.Sockets
         /// Returns a completion slot to the free list while already holding <see cref="_sqSubmitLock"/>.
         /// Minimal cleanup — only resets free-list bookkeeping. Used in error paths within TrySetupDirectSqe.
         /// </summary>
-        private void FreeCompletionSlotUnderLock(int slotIndex)
+        private void FreeCompletionSlotUnderLock(Lock heldSqLock, int slotIndex)
         {
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             ref IoUringCompletionSlot slot = ref _completionSlots![slotIndex];
             ref IoUringTrackedOperationState trackedState = ref _trackedOperations![slotIndex];
             slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
@@ -2338,10 +2331,10 @@ namespace System.Net.Sockets
         /// Must be called after TrySetupDirectSqe returns Prepared and the caller has written SQE fields.
         /// Returns the number of pending submissions so the caller can decide whether to call io_uring_enter.
         /// </summary>
-        internal unsafe uint FinishDirectSqeSubmission()
+        internal unsafe uint FinishDirectSqeSubmission(Lock heldSqLock)
         {
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
-            PublishManagedSqeTail();
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
+            PublishManagedSqeTail(heldSqLock);
             uint pending = _ioUringManagedPendingSubmissions;
             _ioUringManagedPendingSubmissions = 0;
             _ioUringManagedSqTailLoaded = false; // Force re-read from kernel on next SQE acquisition
@@ -2353,16 +2346,20 @@ namespace System.Net.Sockets
         /// Releases <see cref="_sqSubmitLock"/> without publishing (used on error paths after TrySetupDirectSqe
         /// returned Prepared but before SQE write completed successfully).
         /// </summary>
-        internal void AbortDirectSqeSubmission(int slotIndex, SafeSocketHandle socket)
+        /// <summary>Returns the SQ submission lock for callers that need to acquire it.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Lock GetSqSubmitLock() => _sqSubmitLock;
+
+        internal void AbortDirectSqeSubmission(Lock heldSqLock, int slotIndex, SafeSocketHandle socket)
         {
-            Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             ref IoUringCompletionSlotStorage slotStorage = ref _completionSlotStorage![slotIndex];
             slotStorage.DangerousRefSocketHandle = null;
             socket.DangerousRelease();
             // Undo the SQ tail bump (we got an SQE but won't use it)
             _ioUringManagedSqTail--;
             _ioUringManagedPendingSubmissions--;
-            FreeCompletionSlotUnderLock(slotIndex);
+            FreeCompletionSlotUnderLock(heldSqLock, slotIndex);
             _sqSubmitLock.Exit();
         }
 
@@ -2377,8 +2374,9 @@ namespace System.Net.Sockets
         /// Tracks a directly-submitted operation so the CQE drain loop can find it on completion.
         /// Called from any thread while _sqSubmitLock is held (from TrySetupDirectSqe).
         /// </summary>
-        internal bool TryTrackDirectlySubmittedOperation(SocketAsyncContext.AsyncOperation operation)
+        internal bool TryTrackDirectlySubmittedOperation(Lock heldSqLock, SocketAsyncContext.AsyncOperation operation)
         {
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             // _sqSubmitLock is still held from TrySetupDirectSqe
             Debug.Assert(_sqSubmitLock.IsHeldByCurrentThread);
             if (!TryDecodeTrackedIoUringUserData(operation.IoUringUserData, out int slotIndex, out ulong generation))
@@ -2416,6 +2414,7 @@ namespace System.Net.Sockets
         /// Prepares a send SQE, preferring SEND_ZC when eligible and falling back to SEND when unavailable.
         /// </summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectSendWithZeroCopyFallback(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             byte* buffer,
             int bufferLen,
@@ -2428,7 +2427,7 @@ namespace System.Net.Sockets
             if (ShouldTryIoUringDirectSendZeroCopy(bufferLen))
             {
                 SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult zeroCopyResult = TryPrepareIoUringDirectSendCore(
-                    socket, buffer, bufferLen, IoUringOpcodes.SendZc,
+                    heldSqLock, socket, buffer, bufferLen, IoUringOpcodes.SendZc,
                     isZeroCopy: true, flags, out userData, out errorCode);
                 if (zeroCopyResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported)
                 {
@@ -2437,12 +2436,13 @@ namespace System.Net.Sockets
                 }
             }
 
-            return TryPrepareIoUringDirectSendCore(socket, buffer, bufferLen, IoUringOpcodes.Send,
+            return TryPrepareIoUringDirectSendCore(heldSqLock, socket, buffer, bufferLen, IoUringOpcodes.Send,
                 isZeroCopy: false, flags, out userData, out errorCode);
         }
 
         /// <summary>Shared core for send/send_zc SQE preparation via the managed direct path.</summary>
         private unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectSendCore(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             byte* buffer,
             int bufferLen,
@@ -2460,7 +2460,7 @@ namespace System.Net.Sockets
                 return SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
             }
 
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(socket, opcode);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, socket, opcode);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 errorCode = setup.ErrorCode;
@@ -2479,6 +2479,7 @@ namespace System.Net.Sockets
 
         /// <summary>Prepares a recv SQE via the managed direct path.</summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectRecv(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             byte* buffer,
             int bufferLen,
@@ -2496,7 +2497,7 @@ namespace System.Net.Sockets
                 return SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
             }
 
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(socket, IoUringOpcodes.Recv);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, socket, IoUringOpcodes.Recv);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 errorCode = setup.ErrorCode;
@@ -2513,6 +2514,7 @@ namespace System.Net.Sockets
             {
                 case IoUringRecvStrategy.FixedRecv:
                     if (TryPrepareIoUringDirectRecvFixed(
+                        heldSqLock,
                             setup.SlotIndex,
                             setup.Sqe,
                             setup.SqeFd,
@@ -2589,6 +2591,7 @@ namespace System.Net.Sockets
         }
 
         private unsafe bool TryPrepareIoUringDirectRecvFixed(
+            Lock heldSqLock,
             int slotIndex,
             IoUringSqe* sqe,
             int sqeFd,
@@ -2596,6 +2599,7 @@ namespace System.Net.Sockets
             ulong userData,
             int requestedLength)
         {
+            Debug.Assert(heldSqLock.IsHeldByCurrentThread);
             IoUringProvidedBufferRing? providedBufferRing = _ioUringProvidedBufferRing;
             if (providedBufferRing is null)
             {
@@ -2630,20 +2634,23 @@ namespace System.Net.Sockets
 
         /// <summary>Prepares an accept SQE via the managed direct path.</summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectAccept(
+            Lock heldSqLock,
             SafeSocketHandle socket, byte* socketAddress, int socketAddressLen,
             out ulong userData, out SocketError errorCode) =>
-            TryPrepareIoUringDirectAcceptCore(socket, socketAddress, socketAddressLen,
+            TryPrepareIoUringDirectAcceptCore(heldSqLock, socket, socketAddress, socketAddressLen,
                 multishot: false, out userData, out errorCode);
 
         /// <summary>Prepares a multishot accept SQE via the managed direct path.</summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectMultishotAccept(
+            Lock heldSqLock,
             SafeSocketHandle socket, byte* socketAddress, int socketAddressLen,
             out ulong userData, out SocketError errorCode) =>
-            TryPrepareIoUringDirectAcceptCore(socket, socketAddress, socketAddressLen,
+            TryPrepareIoUringDirectAcceptCore(heldSqLock, socket, socketAddress, socketAddressLen,
                 multishot: true, out userData, out errorCode);
 
         /// <summary>Shared core for accept/multishot-accept SQE preparation.</summary>
         private unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectAcceptCore(
+            Lock heldSqLock,
             SafeSocketHandle socket, byte* socketAddress, int socketAddressLen,
             bool multishot, out ulong userData, out SocketError errorCode)
         {
@@ -2654,7 +2661,7 @@ namespace System.Net.Sockets
                 return SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
             }
 
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(socket, IoUringOpcodes.Accept);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, socket, IoUringOpcodes.Accept);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 errorCode = setup.ErrorCode;
@@ -2694,6 +2701,7 @@ namespace System.Net.Sockets
         /// Must be called on this engine's event-loop thread.
         /// </summary>
         internal unsafe bool TryPrepareReusePortMultishotAccept(
+            Lock heldSqLock,
             SafeSocketHandle shadowSocket,
             SocketAsyncContext primaryContext,
             SocketAsyncEngine primaryEngine,
@@ -2705,7 +2713,7 @@ namespace System.Net.Sockets
                 return false;
             }
 
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(shadowSocket, IoUringOpcodes.Accept);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, shadowSocket, IoUringOpcodes.Accept);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 return false;
@@ -2731,6 +2739,7 @@ namespace System.Net.Sockets
 
         /// <summary>Prepares a connect SQE via the managed direct path.</summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectConnect(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             byte* socketAddress,
             int socketAddressLen,
@@ -2739,7 +2748,7 @@ namespace System.Net.Sockets
         {
             userData = 0;
             errorCode = SocketError.Success;
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(socket, IoUringOpcodes.Connect);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, socket, IoUringOpcodes.Connect);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 errorCode = setup.ErrorCode;
@@ -2755,6 +2764,7 @@ namespace System.Net.Sockets
         /// Prepares a sendmsg SQE, preferring SENDMSG_ZC when eligible and falling back to SENDMSG otherwise.
         /// </summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             Interop.Sys.MessageHeader* messageHeader,
             int payloadLength,
@@ -2765,6 +2775,7 @@ namespace System.Net.Sockets
             if (ShouldTryIoUringDirectSendMessageZeroCopy(payloadLength))
             {
                 SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult zeroCopyResult = TryPrepareIoUringDirectMessageCore(
+                    heldSqLock,
                     socket, messageHeader, IoUringOpcodes.SendMsgZc,
                     isReceive: false, isZeroCopy: true, flags, out userData, out errorCode);
                 if (zeroCopyResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported)
@@ -2773,22 +2784,24 @@ namespace System.Net.Sockets
                 }
             }
 
-            return TryPrepareIoUringDirectMessageCore(socket, messageHeader, IoUringOpcodes.SendMsg,
+            return TryPrepareIoUringDirectMessageCore(heldSqLock, socket, messageHeader, IoUringOpcodes.SendMsg,
                 isReceive: false, isZeroCopy: false, flags, out userData, out errorCode);
         }
 
         /// <summary>Prepares a recvmsg SQE via the managed direct path.</summary>
         internal unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectReceiveMessage(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             Interop.Sys.MessageHeader* messageHeader,
             SocketFlags flags,
             out ulong userData,
             out SocketError errorCode) =>
-            TryPrepareIoUringDirectMessageCore(socket, messageHeader, IoUringOpcodes.RecvMsg,
+            TryPrepareIoUringDirectMessageCore(heldSqLock, socket, messageHeader, IoUringOpcodes.RecvMsg,
                 isReceive: true, isZeroCopy: false, flags, out userData, out errorCode);
 
         /// <summary>Shared core for sendmsg/sendmsg_zc/recvmsg SQE preparation via the managed direct path.</summary>
         private unsafe SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult TryPrepareIoUringDirectMessageCore(
+            Lock heldSqLock,
             SafeSocketHandle socket,
             Interop.Sys.MessageHeader* messageHeader,
             byte opcode,
@@ -2806,7 +2819,7 @@ namespace System.Net.Sockets
                 return SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
             }
 
-            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(socket, opcode);
+            IoUringDirectSqeSetupResult setup = TrySetupDirectSqe(heldSqLock, socket, opcode);
             if (setup.PrepareResult != SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Prepared)
             {
                 errorCode = setup.ErrorCode;
@@ -3006,7 +3019,7 @@ namespace System.Net.Sockets
 
             lock (_sqSubmitLock)
             {
-                if (!TryGetNextManagedSqe(out IoUringSqe* sqe))
+                if (!TryGetNextManagedSqe(_sqSubmitLock, out IoUringSqe* sqe))
                     return false;
 
                 sqe->Opcode = IoUringOpcodes.PollAdd;
@@ -3019,7 +3032,7 @@ namespace System.Net.Sockets
                 sqe->RwFlags = IoUringConstants.PollIn;
                 sqe->UserData = EncodeIoUringUserData(IoUringConstants.TagWakeupSignal, 0);
                 // BufIndex, Personality, SpliceFdIn, Addr3: zeroed by TryGetNextManagedSqe.
-                PublishManagedSqeTail();
+                PublishManagedSqeTail(_sqSubmitLock);
             }
             return true;
         }
@@ -3790,7 +3803,7 @@ namespace System.Net.Sockets
 
             // Lock is held from TryAcquireManagedSqeWithRetry
             WriteAsyncCancelSqe(sqe, userData);
-            FinishDirectSqeSubmission();
+            FinishDirectSqeSubmission(_sqSubmitLock);
             return true;
         }
 
@@ -3927,7 +3940,9 @@ namespace System.Net.Sockets
             bool preparedSqe = false;
             while (queue.TryDequeue(out ReusePortShadowSetupRequest request))
             {
+                _sqSubmitLock.Enter();
                 if (TryPrepareReusePortMultishotAccept(
+                        _sqSubmitLock,
                     request.ShadowSocket,
                     request.PrimaryContext,
                     request.PrimaryEngine,
@@ -4082,7 +4097,9 @@ namespace System.Net.Sockets
         {
             preparedSqe = false;
 
-            bool prepared = operation.TryPrepareIoUring(operation.AssociatedContext, prepareSequence);
+            _sqSubmitLock.Enter();
+            bool prepared = operation.TryPrepareIoUring(_sqSubmitLock, operation.AssociatedContext, prepareSequence);
+            _sqSubmitLock.Exit();
             if (prepared)
             {
                 AssertIoUringLifecycleTransition(
@@ -4517,7 +4534,7 @@ namespace System.Net.Sockets
             uint managedPending;
             lock (_sqSubmitLock)
             {
-                PublishManagedSqeTail();
+                PublishManagedSqeTail(_sqSubmitLock);
                 managedPending = _ioUringManagedPendingSubmissions;
                 _ioUringManagedPendingSubmissions = 0;
             }

@@ -1128,7 +1128,7 @@ namespace System.Net.Sockets
             }
 
             /// <summary>Attempts to prepare an SQE for this operation via the managed direct path.</summary>
-            internal bool TryPrepareIoUring(SocketAsyncContext context, long prepareSequence)
+            internal bool TryPrepareIoUring(Lock heldSqLock, SocketAsyncContext context, long prepareSequence)
             {
                 long observedPrepareSequence = Volatile.Read(ref _ioUringPrepareSequence);
                 bool waiting = _state == State.Waiting;
@@ -1161,7 +1161,7 @@ namespace System.Net.Sockets
                     return false;
                 }
 
-                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(context, engine, out ulong directUserData);
+                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(heldSqLock, context, engine, out ulong directUserData);
                 if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
                 {
                     // Operation completed synchronously from early-buffer data during prepare.
@@ -1203,48 +1203,39 @@ namespace System.Net.Sockets
                     ReleaseIoUringPreparationResources();
                 }
 
-                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(context, engine, out ulong directUserData);
+                // Acquire lock — held through prepare+track+publish.
+                // heldSqLock is passed down the entire call chain so every method
+                // that needs the lock has it in its signature.
+                Lock heldSqLock = engine.GetSqSubmitLock();
+                heldSqLock.Enter();
 
-                // CompletedFromBuffer: no SQE was allocated, lock is NOT held.
+                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(heldSqLock, context, engine, out ulong directUserData);
+
                 if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
                 {
+                    heldSqLock.Exit();
                     _state = State.Complete;
                     IoUringUserData = 0;
                     context.TryCompleteIoUringOperation(this);
                     return true;
                 }
 
-                // Prepared: TrySetupDirectSqe acquired _sqSubmitLock and it is HELD.
-                // We must release it via FinishDirectSqeSubmission or AbortDirectSqeSubmission.
-                if (directResult == IoUringDirectPrepareResult.Prepared)
+                if (directResult == IoUringDirectPrepareResult.Prepared && ErrorCode == SocketError.Success)
                 {
-                    if (ErrorCode != SocketError.Success)
-                    {
-                        // SQE was written but the prepare reported an error.
-                        // Abort: undo the SQE, free the slot, release lock.
-                        engine.AbortDirectSqeSubmission(
-                            SocketAsyncEngine.DecodeDirectSqeSlotIndex(directUserData),
-                            context._socket);
-                        IoUringUserData = 0;
-                        return false;
-                    }
-
                     _ioUringSlotExhaustionRetryCount = 0;
                     IoUringUserData = directUserData;
 
-                    // Track the operation so the CQE drain can find it on completion.
-                    if (!engine.TryTrackDirectlySubmittedOperation(this))
+                    // Track under lock — before the kernel can see the SQE.
+                    if (!engine.TryTrackDirectlySubmittedOperation(heldSqLock, this))
                     {
-                        // Tracking failed — abort the submission, release lock.
-                        engine.AbortDirectSqeSubmission(
-                            SocketAsyncEngine.DecodeDirectSqeSlotIndex(directUserData),
-                            context._socket);
+                        heldSqLock.Exit();
                         IoUringUserData = 0;
                         return false;
                     }
 
-                    // Publish SQ tail + release lock + submit to kernel.
-                    uint pending = engine.FinishDirectSqeSubmission();
+                    // Publish SQ tail + release lock.
+                    uint pending = engine.FinishDirectSqeSubmission(heldSqLock);
+                    // Submit to kernel (outside lock).
                     if (pending > 0)
                     {
                         engine.SubmitPendingToKernel(pending);
@@ -1252,7 +1243,8 @@ namespace System.Net.Sockets
                     return true;
                 }
 
-                // PrepareFailed or Unsupported: lock was already released by TrySetupDirectSqe.
+                // PrepareFailed or Unsupported.
+                heldSqLock.Exit();
                 IoUringUserData = 0;
                 return false;
             }
@@ -1754,6 +1746,7 @@ namespace System.Net.Sockets
 
             /// <summary>Prepares an SQE via the managed direct path. Override in subclasses for direct submission.</summary>
             protected virtual IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -1996,6 +1989,7 @@ namespace System.Net.Sockets
 
             /// <summary>Builds a connected send or sendmsg preparation request.</summary>
             private unsafe IoUringDirectPrepareResult IoUringPrepareDirectSendMessage(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2025,7 +2019,7 @@ namespace System.Net.Sockets
                 ConfigureSingleIov(messageHeader, rawBuffer, Count, &sendIov);
 
                 IoUringDirectPrepareResult sendMessagePrepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                    context._socket,
+                        heldSqLock, context._socket,
                     messageHeader,
                     Count,
                     Flags,
@@ -2037,6 +2031,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2055,7 +2050,7 @@ namespace System.Net.Sockets
                     }
 
                     IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectSendWithZeroCopyFallback(
-                        context._socket,
+                        heldSqLock, context._socket,
                         rawBuffer,
                         Count,
                         Flags,
@@ -2071,7 +2066,7 @@ namespace System.Net.Sockets
                     return prepareResult;
                 }
 
-                return IoUringPrepareDirectSendMessage(context, engine, out userData);
+                return IoUringPrepareDirectSendMessage(heldSqLock, context, engine, out userData);
             }
         }
 
@@ -2181,6 +2176,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2243,7 +2239,7 @@ namespace System.Net.Sockets
                         }
 
                         IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                            context._socket,
+                            heldSqLock, context._socket,
                             &messageHeader,
                             (int)totalPayloadBytes,
                             Flags,
@@ -2257,7 +2253,7 @@ namespace System.Net.Sockets
                 messageHeader.IOVectors = null;
                 messageHeader.IOVectorCount = 0;
                 IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                    context._socket,
+                        heldSqLock, context._socket,
                     &messageHeader,
                     payloadLength: 0,
                     Flags,
@@ -2378,6 +2374,7 @@ namespace System.Net.Sockets
 
             /// <summary>Builds a connected or receive-from recvmsg operation.</summary>
             private unsafe IoUringDirectPrepareResult IoUringPrepareDirectReceiveMessage(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2402,6 +2399,7 @@ namespace System.Net.Sockets
                 ConfigureSingleIov(messageHeader, rawBuffer, Buffer.Length, &receiveIov);
 
                 IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                     context._socket,
                     messageHeader,
                     Flags,
@@ -2449,6 +2447,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2463,7 +2462,7 @@ namespace System.Net.Sockets
 
                     SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.OneShot);
                     IoUringDirectPrepareResult receiveMessagePrepareResult =
-                        IoUringPrepareDirectReceiveMessage(context, engine, out userData);
+                        IoUringPrepareDirectReceiveMessage(heldSqLock, context, engine, out userData);
                     if (receiveMessagePrepareResult != IoUringDirectPrepareResult.Prepared || ErrorCode != SocketError.Success)
                     {
                         SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.None);
@@ -2523,6 +2522,7 @@ namespace System.Net.Sockets
                 }
 
                 IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectRecv(
+                    heldSqLock,
                     context._socket,
                     rawBuffer,
                     Buffer.Length,
@@ -2670,6 +2670,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2714,6 +2715,7 @@ namespace System.Net.Sockets
                         messageHeader->IOVectors = iovecsPtr;
                         messageHeader->IOVectorCount = iovCount;
                         IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                             context._socket,
                             messageHeader,
                             Flags,
@@ -2727,6 +2729,7 @@ namespace System.Net.Sockets
                 messageHeader->IOVectors = null;
                 messageHeader->IOVectorCount = 0;
                 IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                     context._socket,
                     messageHeader,
                     Flags,
@@ -2840,6 +2843,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2946,6 +2950,7 @@ namespace System.Net.Sockets
                             messageHeader->IOVectors = iovecsPtr;
                             messageHeader->IOVectorCount = iovCount;
                             IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                                 context._socket,
                                 messageHeader,
                                 Flags,
@@ -2959,6 +2964,7 @@ namespace System.Net.Sockets
                     messageHeader->IOVectors = null;
                     messageHeader->IOVectorCount = 0;
                     IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                         context._socket,
                         messageHeader,
                         Flags,
@@ -2974,6 +2980,7 @@ namespace System.Net.Sockets
                 messageHeader->IOVectors = &iov;
                 messageHeader->IOVectorCount = 1;
                 IoUringDirectPrepareResult singleBufferPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
+                    heldSqLock,
                     context._socket,
                     messageHeader,
                     Flags,
@@ -3059,6 +3066,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -3078,6 +3086,7 @@ namespace System.Net.Sockets
                 {
                     context.EnsureMultishotAcceptQueueInitialized();
                     IoUringDirectPrepareResult multishotPrepareResult = engine.TryPrepareIoUringDirectMultishotAccept(
+                        heldSqLock,
                         context._socket,
                         rawSocketAddress,
                         SocketAddress.Length,
@@ -3098,6 +3107,7 @@ namespace System.Net.Sockets
                 }
 
                 IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectAccept(
+                    heldSqLock,
                     context._socket,
                     rawSocketAddress,
                     SocketAddress.Length,
@@ -3132,6 +3142,7 @@ namespace System.Net.Sockets
 
             /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -3143,6 +3154,7 @@ namespace System.Net.Sockets
                 }
 
                 IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectConnect(
+                    heldSqLock,
                     context._socket,
                     rawSocketAddress,
                     SocketAddress.Length,
