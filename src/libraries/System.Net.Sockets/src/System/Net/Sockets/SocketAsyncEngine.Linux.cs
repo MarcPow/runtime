@@ -375,6 +375,7 @@ namespace System.Net.Sockets
             // Poll flags
             internal const uint PollAddFlagMulti = 1u << 0;
             internal const uint PollIn = 0x0001;
+            internal const uint PollOut = 0x0004;
 
             // CQE flags
             internal const uint CqeFBuffer = 1u << 0; // IORING_CQE_F_BUFFER (buffer id in upper bits)
@@ -477,6 +478,7 @@ namespace System.Net.Sockets
             Accept = 1,
             Message = 2,
             ReusePortAccept = 3,
+            PollReadiness = 4,
         }
 
         /// <summary>
@@ -1246,6 +1248,33 @@ namespace System.Net.Sockets
                                 handler.DispatchZeroCopyIoUringNotification(payload);
                                 // Free the slot AFTER dispatch has taken the tracked operation.
                                 FreeCompletionSlot(DecodeCompletionSlotIndex(payload));
+                                drained++;
+                                continue;
+                            }
+                        }
+
+                        // Check for writability poll — re-submit the pending write now that the socket is writable.
+                        {
+                            int pollSlotIndex = DecodeCompletionSlotIndex(payload);
+                            IoUringCompletionSlot[]? pollSlots = _completionSlots;
+                            if (pollSlots is not null &&
+                                (uint)pollSlotIndex < (uint)pollSlots.Length &&
+                                pollSlots[pollSlotIndex].Kind == IoUringCompletionOperationKind.PollReadiness)
+                            {
+                                // Take the tracked pending operation and re-submit it inline.
+                                if (TryTakeTrackedIoUringOperation(userData, out SocketAsyncContext.AsyncOperation? pendingOp) &&
+                                    pendingOp is not null)
+                                {
+                                    // Re-prepare inline on the event loop — socket is now writable.
+                                    long seq = pendingOp.MarkReadyForIoUringPreparation();
+                                    TryPrepareAndTrackIoUringOperation(pendingOp, seq, out _);
+                                }
+
+                                // Free the poll slot (terminal if no CQE_F_MORE, keep if multi-shot still active).
+                                if ((flags & IoUringConstants.CqeFMore) == 0)
+                                {
+                                    FreeCompletionSlot(pollSlotIndex);
+                                }
                                 drained++;
                                 continue;
                             }
@@ -3049,6 +3078,56 @@ namespace System.Net.Sockets
                 PublishManagedSqeTail(_sqSubmitLock);
             }
             return true;
+        }
+
+        /// <summary>
+        /// Submits a multi-shot POLL_ADD for the specified poll events on the given socket fd.
+        /// When the socket becomes ready, the CQE is dispatched to re-submit the pending operation.
+        /// Must be called from the event loop thread (inside DrainCqeRingBatch CQE dispatch).
+        /// </summary>
+        internal unsafe bool TryQueueReadinessPoll(int socketFd, uint pollEvents, bool multishot, SocketAsyncContext.AsyncOperation operation)
+        {
+            Lock heldSqLock = _sqSubmitLock;
+            heldSqLock.Enter();
+            try
+            {
+                int slotIndex = AllocateCompletionSlot(heldSqLock);
+                if (slotIndex < 0)
+                    return false;
+
+                if (!TryGetNextManagedSqe(heldSqLock, out IoUringSqe* sqe))
+                {
+                    FreeCompletionSlotUnderLock(heldSqLock, slotIndex);
+                    return false;
+                }
+
+                ref IoUringCompletionSlot slot = ref _completionSlots![slotIndex];
+                ulong userData = EncodeCompletionSlotUserData(slotIndex, slot.Generation);
+                SetCompletionSlotKind(ref slot, IoUringCompletionOperationKind.PollReadiness);
+
+                // Track the pending operation so we can re-submit it when writable.
+                ref IoUringTrackedOperationState entry = ref _trackedOperations![slotIndex];
+                Volatile.Write(ref entry.TrackedOperationGeneration, (userData >> IoUringConstants.SlotIndexBits) & IoUringConstants.GenerationMask);
+                Volatile.Write(ref entry.TrackedOperation, operation);
+                Interlocked.Increment(ref _trackedIoUringOperationCount);
+
+                sqe->Opcode = IoUringOpcodes.PollAdd;
+                sqe->Flags = 0;
+                sqe->Ioprio = 0;
+                sqe->Fd = socketFd;
+                sqe->Off = 0;
+                sqe->Addr = 0;
+                sqe->Len = multishot ? IoUringConstants.PollAddFlagMulti : 0u;
+                sqe->RwFlags = pollEvents;
+                sqe->UserData = userData;
+
+                PublishManagedSqeTail(heldSqLock);
+                return true;
+            }
+            finally
+            {
+                heldSqLock.Exit();
+            }
         }
 
         /// <summary>Attempts to register the ring fd for fixed-fd submission.</summary>

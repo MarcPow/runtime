@@ -707,6 +707,24 @@ namespace System.Net.Sockets
             /// <summary>Requeues a pending operation or falls back to readiness notification.</summary>
             private bool DispatchPendingIoUringOperation(SocketAsyncContext.AsyncOperation operation)
             {
+                // On EAGAIN, use POLL_ADD to wait for readiness instead of blind re-submit.
+                // - Writes: multi-shot POLLOUT (stays armed across partial-write retries)
+                // - Reads: one-shot POLLIN (fires immediately if data already available,
+                //   avoiding the edge-triggered missed-transition race)
+                Interop.Sys.SocketEvents neededEvents = operation.GetIoUringFallbackSocketEvents();
+                if (neededEvents != Interop.Sys.SocketEvents.None)
+                {
+                    bool isWrite = neededEvents == Interop.Sys.SocketEvents.Write;
+                    uint pollEvents = isWrite ? IoUringConstants.PollOut : IoUringConstants.PollIn;
+                    bool multishot = isWrite; // multi-shot for writes, one-shot for reads
+                    int socketFd = operation.AssociatedContext.GetSocketFdForPoll();
+                    if (socketFd >= 0 && _engine.TryQueueReadinessPoll(socketFd, pollEvents, multishot, operation))
+                    {
+                        return false;
+                    }
+                    // Fall through to inline re-prepare if POLL_ADD fails
+                }
+
                 PendingIoUringReprepareResult inlineReprepareResult = TryDispatchPendingIoUringOperationInline(operation);
                 if (inlineReprepareResult == PendingIoUringReprepareResult.Prepared)
                 {

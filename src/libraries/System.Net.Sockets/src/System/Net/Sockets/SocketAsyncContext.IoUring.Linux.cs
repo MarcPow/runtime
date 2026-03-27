@@ -229,6 +229,19 @@ namespace System.Net.Sockets
             return prior ?? created;
         }
 
+        /// <summary>Returns the raw socket fd for POLL_ADD SQE submission. Returns -1 if unavailable.</summary>
+        internal int GetSocketFdForPoll()
+        {
+            try
+            {
+                return (int)(nint)_socket.DangerousGetHandle();
+            }
+            catch (ObjectDisposedException)
+            {
+                return -1;
+            }
+        }
+
         /// <summary>Returns whether this context's engine is using io_uring completion mode.</summary>
         private bool IsIoUringCompletionModeEnabled()
         {
