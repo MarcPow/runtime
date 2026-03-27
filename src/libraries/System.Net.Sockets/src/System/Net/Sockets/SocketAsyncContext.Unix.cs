@@ -1072,6 +1072,18 @@ namespace System.Net.Sockets
                 observedSequenceNumber = Volatile.Read(ref _sequenceNumber);
 
                 bool isReady = state == QueueState.Ready || state == QueueState.Stopped;
+
+                // When io_uring is active, never report ready — force all operations through
+                // the SQE submission path. The socket is blocking (no O_NONBLOCK), so the
+                // synchronous TryComplete* would block the calling thread. The kernel's
+                // FAST_POLL handles the waiting internally via io_uring.
+                if (isReady && context.IsIoUringCompletionModeEnabled())
+                {
+                    observedSequenceNumber--;
+                    Trace(context, "false (io_uring bypass)");
+                    return false;
+                }
+
                 if (!isReady)
                 {
                     observedSequenceNumber--;
@@ -1778,11 +1790,11 @@ namespace System.Net.Sockets
             }
 
             // When io_uring completion mode is active, keep sockets BLOCKING.
-            // The kernel's FAST_POLL (IORING_FEAT_FAST_POLL) handles async waiting
-            // internally for blocking sockets — if an operation would block, the kernel
-            // arms an internal poll and re-executes when the socket is ready. Userspace
-            // never sees EAGAIN, eliminating the need for retry logic.
-            // O_NONBLOCK is only needed for the epoll path.
+            // The kernel's FAST_POLL (IORING_FEAT_FAST_POLL, Linux 5.7+) handles async
+            // waiting internally for blocking sockets — if an io_uring send/recv would
+            // block, the kernel arms an internal poll and re-executes when the socket is
+            // ready. Userspace never sees EAGAIN, eliminating the entire retry path.
+            // O_NONBLOCK is only needed for the epoll path's synchronous try.
             if (IsIoUringCompletionModeEnabled())
             {
                 return;
