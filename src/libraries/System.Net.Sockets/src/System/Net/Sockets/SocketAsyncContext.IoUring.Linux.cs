@@ -1950,7 +1950,8 @@ namespace System.Net.Sockets
                 Offset += sent;
                 Count -= sent;
                 ErrorCode = SocketError.Success;
-                return Count == 0;
+                // Contract: SendAsync returns bytes actually sent. Caller retries for remainder.
+                return true;
             }
         }
 
