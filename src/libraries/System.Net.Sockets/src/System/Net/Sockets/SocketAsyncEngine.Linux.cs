@@ -3986,6 +3986,17 @@ namespace System.Net.Sockets
                 return;
             }
 
+            // When io_uring is active with blocking sockets, NEVER enqueue readiness
+            // fallback events. The ThreadPool worker would call HandleEvents →
+            // ProcessQueuedOperation → TryComplete → blocking send()/recv() syscall,
+            // deadlocking the ThreadPool. Instead, wake the event loop to re-drain
+            // queues — operations will be re-staged via io_uring SQE submission.
+            if (_ioUringCapabilities.IsCompletionMode)
+            {
+                WakeEventLoop();
+                return;
+            }
+
             _eventQueue.Enqueue(new SocketIOEvent(context, events));
             if (countAsPrepareQueueOverflowFallback)
             {

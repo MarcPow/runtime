@@ -13,6 +13,24 @@ namespace System.Net.Sockets
 {
     internal sealed partial class SocketAsyncContext
     {
+        private sealed class IoUringStrategy : ISocketIoStrategy
+        {
+            public static readonly IoUringStrategy Instance = new();
+
+            public void PrepareForAsyncIo(SocketAsyncContext context)
+            {
+                // Keep socket blocking. Kernel FAST_POLL handles async waiting internally.
+            }
+
+            public bool ShouldTrySynchronous<TOperation>(ref OperationQueue<TOperation> queue, SocketAsyncContext context, out int observedSequenceNumber) where TOperation : AsyncOperation
+            {
+                // Never try synchronously — send()/recv() would block the thread.
+                // Get sequence number for StartAsyncOperation but skip the sync try.
+                observedSequenceNumber = queue.GetObservedSequenceNumberForIoUringBypass();
+                return false;
+            }
+        }
+
         private const int MultishotAcceptQueueMaxSize = 4096;
         private const int PersistentMultishotRecvDataQueueMaxSize = 64;
         private const int SolSocket = 1;
@@ -247,6 +265,15 @@ namespace System.Net.Sockets
         {
             SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
             return engine is not null && engine.IsIoUringCompletionModeEnabled;
+        }
+
+        /// <summary>Sets the I/O strategy to IoUringStrategy if the registered engine uses io_uring completion mode.</summary>
+        partial void LinuxSetIoStrategyAfterRegistration(SocketAsyncEngine engine)
+        {
+            if (engine.IsIoUringCompletionModeEnabled)
+            {
+                _ioStrategy = IoUringStrategy.Instance;
+            }
         }
 
         /// <summary>Returns the total count of non-pinnable buffer prepare fallbacks across active engines.</summary>

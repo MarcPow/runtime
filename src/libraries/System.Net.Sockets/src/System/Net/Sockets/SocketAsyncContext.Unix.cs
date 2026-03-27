@@ -33,6 +33,36 @@ namespace System.Net.Sockets
 
     internal sealed partial class SocketAsyncContext
     {
+        /// <summary>
+        /// Strategy for socket I/O behavior that differs between epoll and io_uring.
+        /// Eliminates scattered if-checks by encapsulating the behavioral differences.
+        /// </summary>
+        private interface ISocketIoStrategy
+        {
+            /// <summary>Prepare socket for async I/O. epoll: set O_NONBLOCK. io_uring: no-op.</summary>
+            void PrepareForAsyncIo(SocketAsyncContext context);
+
+            /// <summary>Can we try the operation synchronously? epoll: yes. io_uring: never (would block).</summary>
+            bool ShouldTrySynchronous<TOperation>(ref OperationQueue<TOperation> queue, SocketAsyncContext context, out int observedSequenceNumber) where TOperation : AsyncOperation;
+        }
+
+        private sealed class EpollStrategy : ISocketIoStrategy
+        {
+            public static readonly EpollStrategy Instance = new();
+
+            public void PrepareForAsyncIo(SocketAsyncContext context)
+            {
+                context.SetHandleNonBlockingInternal();
+            }
+
+            public bool ShouldTrySynchronous<TOperation>(ref OperationQueue<TOperation> queue, SocketAsyncContext context, out int observedSequenceNumber) where TOperation : AsyncOperation
+            {
+                return queue.IsReady(context, out observedSequenceNumber);
+            }
+        }
+
+        private ISocketIoStrategy _ioStrategy = EpollStrategy.Instance;
+
         // Cached operation instances for operations commonly repeated on the same socket instance,
         // e.g. async accepts, sends/receives with single and multiple buffers.  More can be
         // added in the future if necessary, at the expense of extra fields here.  With a larger
@@ -117,6 +147,7 @@ namespace System.Net.Sockets
         partial void LinuxTryConsumeBufferedPersistentMultishotRecvData(Memory<byte> destination, ref bool consumed, ref int bytesTransferred);
         partial void LinuxOnStopAndAbort();
         partial void LinuxHasBufferedPersistentMultishotRecvData(ref bool hasBuffered);
+        partial void LinuxSetIoStrategyAfterRegistration(SocketAsyncEngine engine);
 
         internal abstract partial class AsyncOperation : IThreadPoolWorkItem
         {
@@ -1055,6 +1086,15 @@ namespace System.Net.Sockets
                 _sequenceNumber = 0;
             }
 
+            /// <summary>
+            /// Returns a sequence number suitable for io_uring bypass (always returns false from strategy).
+            /// Reads the volatile sequence number and decrements it so StartAsyncOperation will retry.
+            /// </summary>
+            public int GetObservedSequenceNumberForIoUringBypass()
+            {
+                return Volatile.Read(ref _sequenceNumber) - 1;
+            }
+
             // IsReady returns whether an operation can be executed immediately.
             // observedSequenceNumber must be passed to StartAsyncOperation.
             public bool IsReady(SocketAsyncContext context, out int observedSequenceNumber)
@@ -1072,17 +1112,6 @@ namespace System.Net.Sockets
                 observedSequenceNumber = Volatile.Read(ref _sequenceNumber);
 
                 bool isReady = state == QueueState.Ready || state == QueueState.Stopped;
-
-                // When io_uring is active, never report ready — force all operations through
-                // the SQE submission path. The socket is blocking (no O_NONBLOCK), so the
-                // synchronous TryComplete* would block the calling thread. The kernel's
-                // FAST_POLL handles the waiting internally via io_uring.
-                if (isReady && context.IsIoUringCompletionModeEnabled())
-                {
-                    observedSequenceNumber--;
-                    Trace(context, "false (io_uring bypass)");
-                    return false;
-                }
 
                 if (!isReady)
                 {
@@ -1679,6 +1708,7 @@ namespace System.Net.Sockets
                         if (SocketAsyncEngine.TryRegisterSocket(handle, this, out SocketAsyncEngine? engine, out error))
                         {
                             Volatile.Write(ref _asyncEngine, engine);
+                            LinuxSetIoStrategyAfterRegistration(engine!);
 
                             Trace("Registered");
                             return true;
@@ -1783,20 +1813,14 @@ namespace System.Net.Sockets
 
         public void SetHandleNonBlocking()
         {
+            _ioStrategy.PrepareForAsyncIo(this);
+        }
+
+        private void SetHandleNonBlockingInternal()
+        {
             if (OperatingSystem.IsWasi())
             {
                 // WASI sockets are always non-blocking, because in ST we don't have another thread which could be blocked
-                return;
-            }
-
-            // When io_uring completion mode is active, keep sockets BLOCKING.
-            // The kernel's FAST_POLL (IORING_FEAT_FAST_POLL, Linux 5.7+) handles async
-            // waiting internally for blocking sockets — if an io_uring send/recv would
-            // block, the kernel arms an internal poll and re-executes when the socket is
-            // ready. Userspace never sees EAGAIN, eliminating the entire retry path.
-            // O_NONBLOCK is only needed for the epoll path's synchronous try.
-            if (IsIoUringCompletionModeEnabled())
-            {
                 return;
             }
 
@@ -1954,11 +1978,11 @@ namespace System.Net.Sockets
             Debug.Assert(socketAddress.Length > 0, $"Unexpected socketAddressLen: {socketAddress.Length}");
             Debug.Assert(callback != null, "Expected non-null callback");
 
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_receiveQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _receiveQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteAccept(_socket, socketAddress, out socketAddressLen, out acceptedFd, out errorCode))
             {
                 Debug.Assert(errorCode == SocketError.Success || acceptedFd == (IntPtr)(-1), $"Unexpected values: errorCode={errorCode}, acceptedFd={acceptedFd}");
@@ -2019,14 +2043,14 @@ namespace System.Net.Sockets
             Debug.Assert(socketAddress.Length > 0, $"Unexpected socketAddressLen: {socketAddress.Length}");
             Debug.Assert(callback != null, "Expected non-null callback");
 
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             // Connect is different than the usual "readiness" pattern of other operations.
             // We need to initiate the connect before we try to complete it.
             // Thus, always call TryStartConnect regardless of readiness.
             SocketError errorCode;
             int observedSequenceNumber;
-            _sendQueue.IsReady(this, out observedSequenceNumber);
+            _ioStrategy.ShouldTrySynchronous(ref _sendQueue, this, out observedSequenceNumber);
 #if SYSTEM_NET_SOCKETS_APPLE_PLATFROM
             if (SocketPal.TryStartConnect(_socket, socketAddress, out errorCode, buffer.Span, _socket.TfoEnabled, out sentBytes))
 #else
@@ -2146,7 +2170,7 @@ namespace System.Net.Sockets
 
         public SocketError ReceiveAsync(Memory<byte> buffer, SocketFlags flags, out int bytesReceived, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken = default)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
@@ -2157,7 +2181,7 @@ namespace System.Net.Sockets
             // consume the early buffer via DoTryComplete or CompletedFromBuffer on the event loop.
             bool hasEarlyBuffered = false;
             LinuxHasBufferedPersistentMultishotRecvData(ref hasEarlyBuffered);
-            if (_receiveQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _receiveQueue, this, out observedSequenceNumber) &&
                 !hasEarlyBuffered &&
                 SocketPal.TryCompleteReceive(_socket, buffer.Span, flags, out bytesReceived, out errorCode))
             {
@@ -2186,11 +2210,11 @@ namespace System.Net.Sockets
 
         public SocketError ReceiveFromAsync(Memory<byte> buffer, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken = default)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_receiveQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _receiveQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteReceiveFrom(_socket, buffer.Span, flags, socketAddress.Span, out socketAddressLen, out bytesReceived, out receivedFlags, out errorCode))
             {
                 return errorCode;
@@ -2262,11 +2286,11 @@ namespace System.Net.Sockets
 
         public SocketError ReceiveFromAsync(IList<ArraySegment<byte>> buffers, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_receiveQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _receiveQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteReceiveFrom(_socket, buffers, flags, socketAddress.Span, out socketAddressLen, out bytesReceived, out receivedFlags, out errorCode))
             {
                 // Synchronous success or failure
@@ -2371,11 +2395,11 @@ namespace System.Net.Sockets
 
         public SocketError ReceiveMessageFromAsync(Memory<byte> buffer, IList<ArraySegment<byte>>? buffers, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, bool isIPv4, bool isIPv6, out int bytesReceived, out SocketFlags receivedFlags, out IPPacketInformation ipPacketInformation, Action<int, Memory<byte>, SocketFlags, IPPacketInformation, SocketError> callback, CancellationToken cancellationToken = default)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_receiveQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _receiveQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteReceiveMessageFrom(_socket, buffer.Span, buffers, flags, socketAddress, out socketAddressLen, isIPv4, isIPv6, out bytesReceived, out receivedFlags, out ipPacketInformation, out errorCode))
             {
                 return errorCode;
@@ -2488,11 +2512,11 @@ namespace System.Net.Sockets
 
         public SocketError SendToAsync(Memory<byte> buffer, int offset, int count, SocketFlags flags, Memory<byte> socketAddress, ref int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken = default)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_sendQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _sendQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteSendTo(_socket, buffer.Span, ref offset, ref count, flags, socketAddress.Span, ref bytesSent, out errorCode))
             {
                 return errorCode;
@@ -2563,14 +2587,14 @@ namespace System.Net.Sockets
 
         public SocketError SendToAsync(IList<ArraySegment<byte>> buffers, SocketFlags flags, Memory<byte> socketAddress, out int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             bytesSent = 0;
             int bufferIndex = 0;
             int offset = 0;
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_sendQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _sendQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteSendTo(_socket, buffers, ref bufferIndex, ref offset, flags, socketAddress.Span, ref bytesSent, out errorCode))
             {
                 return errorCode;
@@ -2627,12 +2651,12 @@ namespace System.Net.Sockets
 
         public SocketError SendFileAsync(SafeFileHandle fileHandle, long offset, long count, out long bytesSent, Action<long, SocketError> callback, CancellationToken cancellationToken = default)
         {
-            SetHandleNonBlocking();
+            _ioStrategy.PrepareForAsyncIo(this);
 
             bytesSent = 0;
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_sendQueue.IsReady(this, out observedSequenceNumber) &&
+            if (_ioStrategy.ShouldTrySynchronous(ref _sendQueue, this, out observedSequenceNumber) &&
                 SocketPal.TryCompleteSendFile(_socket, fileHandle, ref offset, ref count, ref bytesSent, out errorCode))
             {
                 return errorCode;

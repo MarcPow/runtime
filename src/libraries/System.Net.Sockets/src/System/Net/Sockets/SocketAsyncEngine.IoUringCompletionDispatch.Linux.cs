@@ -738,10 +738,20 @@ namespace System.Net.Sockets
                     return false;
                 }
 
-                Debug.Assert(
-                    inlineReprepareResult == PendingIoUringReprepareResult.Failed ||
-                    !_engine._ioUringCapabilities.IsCompletionMode,
-                    "Requeue should not fail in pure io_uring completion mode when inline re-prepare was not attempted.");
+                // When io_uring is active with blocking sockets, NEVER fall through to the
+                // readiness fallback path — it calls ProcessQueuedOperation → TryComplete →
+                // direct send()/recv() syscall which BLOCKS the ThreadPool thread on a blocking socket.
+                // Instead, force retry via MPSC queue (unbounded, should always accept).
+                if (_engine._ioUringCapabilities.IsCompletionMode)
+                {
+                    if (!operation.TryQueueIoUringPreparation())
+                    {
+                        // MPSC queue rejected (should not happen with unbounded queue).
+                        // Last resort: wake the event loop to drain and retry.
+                        _engine.WakeEventLoop();
+                    }
+                    return false;
+                }
 
                 operation.ClearIoUringUserData();
                 Interop.Sys.SocketEvents fallbackEvents = operation.GetIoUringFallbackSocketEvents();
