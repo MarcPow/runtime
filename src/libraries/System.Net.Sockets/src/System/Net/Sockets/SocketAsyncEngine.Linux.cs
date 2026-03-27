@@ -2160,13 +2160,22 @@ namespace System.Net.Sockets
 
             for (int attempt = 0; attempt < MaxIoUringSqeAcquireSubmitAttempts; attempt++)
             {
-                _sqSubmitLock.Enter();
-                if (TryGetNextManagedSqe(_sqSubmitLock, out sqe))
+                Lock heldSqLock = _sqSubmitLock;
+                heldSqLock.Enter();
+                try
                 {
-                    // Lock held — caller writes SQE, then calls FinishDirectSqeSubmission to publish + release.
-                    return true;
+                    if (TryGetNextManagedSqe(heldSqLock, out sqe))
+                    {
+                        // Success: lock intentionally stays held.
+                        // Caller writes SQE, then calls FinishDirectSqeSubmission to publish + release.
+                        return true;
+                    }
                 }
-                _sqSubmitLock.Exit();
+                finally
+                {
+                    // Release only if we didn't return success (lock escapes on success).
+                    if (sqe == null) heldSqLock.Exit();
+                }
 
                 // Before retrying submission, run a CQ drain pass so completions can release
                 // slots and unblock kernel forward progress. The overflow counter is observed
@@ -2182,12 +2191,18 @@ namespace System.Net.Sockets
                     }
                     _ = DrainCqeRingBatch(drainHandler);
 
-                    _sqSubmitLock.Enter();
-                    if (TryGetNextManagedSqe(_sqSubmitLock, out sqe))
+                    heldSqLock.Enter();
+                    try
                     {
-                        return true;
+                        if (TryGetNextManagedSqe(heldSqLock, out sqe))
+                        {
+                            return true;
+                        }
                     }
-                    _sqSubmitLock.Exit();
+                    finally
+                    {
+                        if (sqe == null) heldSqLock.Exit();
+                    }
                 }
 
                 submitError = SubmitIoUringOperationsNormalized();
@@ -2327,9 +2342,9 @@ namespace System.Net.Sockets
         }
 
         /// <summary>
-        /// Publishes the SQ tail and releases <see cref="_sqSubmitLock"/> after a successful SQE write.
-        /// Must be called after TrySetupDirectSqe returns Prepared and the caller has written SQE fields.
-        /// Returns the number of pending submissions so the caller can decide whether to call io_uring_enter.
+        /// Publishes the SQ tail under <see cref="_sqSubmitLock"/> (caller must hold it).
+        /// Does NOT release the lock — caller is responsible via try/finally.
+        /// Returns the number of pending submissions so the caller can submit after releasing.
         /// </summary>
         internal unsafe uint FinishDirectSqeSubmission(Lock heldSqLock)
         {
@@ -2337,8 +2352,7 @@ namespace System.Net.Sockets
             PublishManagedSqeTail(heldSqLock);
             uint pending = _ioUringManagedPendingSubmissions;
             _ioUringManagedPendingSubmissions = 0;
-            _ioUringManagedSqTailLoaded = false; // Force re-read from kernel on next SQE acquisition
-            _sqSubmitLock.Exit();
+            _ioUringManagedSqTailLoaded = false;
             return pending;
         }
 
@@ -3796,14 +3810,21 @@ namespace System.Net.Sockets
                 return false;
             }
 
+            // TryAcquireManagedSqeWithRetry returns with _sqSubmitLock held on success.
             if (!TryAcquireManagedSqeWithRetry(out IoUringSqe* sqe, out _))
             {
                 return false;
             }
 
-            // Lock is held from TryAcquireManagedSqeWithRetry
-            WriteAsyncCancelSqe(sqe, userData);
-            FinishDirectSqeSubmission(_sqSubmitLock);
+            try
+            {
+                WriteAsyncCancelSqe(sqe, userData);
+                FinishDirectSqeSubmission(_sqSubmitLock);
+            }
+            finally
+            {
+                _sqSubmitLock.Exit();
+            }
             return true;
         }
 
@@ -3940,16 +3961,24 @@ namespace System.Net.Sockets
             bool preparedSqe = false;
             while (queue.TryDequeue(out ReusePortShadowSetupRequest request))
             {
-                _sqSubmitLock.Enter();
-                if (TryPrepareReusePortMultishotAccept(
-                        _sqSubmitLock,
-                    request.ShadowSocket,
-                    request.PrimaryContext,
-                    request.PrimaryEngine,
-                    out ulong userData))
+                Lock heldSqLock = _sqSubmitLock;
+                heldSqLock.Enter();
+                try
                 {
-                    preparedSqe = true;
-                    request.PrimaryContext.RecordReusePortShadowArmed(userData, _engineIndex);
+                    if (TryPrepareReusePortMultishotAccept(
+                            heldSqLock,
+                        request.ShadowSocket,
+                        request.PrimaryContext,
+                        request.PrimaryEngine,
+                        out ulong userData))
+                    {
+                        preparedSqe = true;
+                        request.PrimaryContext.RecordReusePortShadowArmed(userData, _engineIndex);
+                    }
+                }
+                finally
+                {
+                    heldSqLock.Exit();
                 }
             }
             return preparedSqe;
@@ -4097,28 +4126,39 @@ namespace System.Net.Sockets
         {
             preparedSqe = false;
 
-            _sqSubmitLock.Enter();
-            bool prepared = operation.TryPrepareIoUring(_sqSubmitLock, operation.AssociatedContext, prepareSequence);
-            _sqSubmitLock.Exit();
-            if (prepared)
+            // Hold lock through prepare+track+publish — same discipline as TryDirectSubmitIoUring.
+            // This prevents another thread's FinishDirectSqeSubmission from publishing a SQ tail
+            // that includes our SQE before we've registered the tracked operation.
+            Lock heldSqLock = _sqSubmitLock;
+            bool prepared;
+            heldSqLock.Enter();
+            try
             {
-                AssertIoUringLifecycleTransition(
-                    IoUringOperationLifecycleState.Queued,
-                    IoUringOperationLifecycleState.Prepared);
-            }
-
-            if (prepared && operation.ErrorCode == SocketError.Success)
-            {
-                preparedSqe = true;
-                if (!TryTrackPreparedIoUringOperation(operation))
+                prepared = operation.TryPrepareIoUring(heldSqLock, operation.AssociatedContext, prepareSequence);
+                if (prepared)
                 {
-                    // Invariant violation: tracking collision after prepare.
-                    // A prepared SQE may now complete without a managed owner; do not attempt best-effort recovery.
-                    operation.ClearIoUringUserData();
-                    ThrowInternalException("io_uring tracking collision: prepared SQE could not be tracked by user_data");
+                    AssertIoUringLifecycleTransition(
+                        IoUringOperationLifecycleState.Queued,
+                        IoUringOperationLifecycleState.Prepared);
                 }
 
-                return Interop.Error.SUCCESS;
+                if (prepared && operation.ErrorCode == SocketError.Success)
+                {
+                    preparedSqe = true;
+                    if (!TryTrackPreparedIoUringOperation(operation))
+                    {
+                        operation.ClearIoUringUserData();
+                        ThrowInternalException("io_uring tracking collision: prepared SQE could not be tracked by user_data");
+                    }
+
+                    // Publish SQ tail under lock so the kernel only sees the SQE after tracking is complete.
+                    PublishManagedSqeTail(heldSqLock);
+                    return Interop.Error.SUCCESS;
+                }
+            }
+            finally
+            {
+                heldSqLock.Exit();
             }
 
             if (prepared)

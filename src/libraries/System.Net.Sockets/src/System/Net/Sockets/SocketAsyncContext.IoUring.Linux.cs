@@ -1208,43 +1208,54 @@ namespace System.Net.Sockets
                 // that needs the lock has it in its signature.
                 Lock heldSqLock = engine.GetSqSubmitLock();
                 heldSqLock.Enter();
+                IoUringDirectPrepareResult directResult;
+                ulong directUserData;
+                uint pending = 0;
+                try
+                {
+                    directResult = IoUringPrepareDirect(heldSqLock, context, engine, out directUserData);
 
-                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(heldSqLock, context, engine, out ulong directUserData);
+                    if (directResult == IoUringDirectPrepareResult.Prepared && ErrorCode == SocketError.Success)
+                    {
+                        _ioUringSlotExhaustionRetryCount = 0;
+                        IoUringUserData = directUserData;
+
+                        if (!engine.TryTrackDirectlySubmittedOperation(heldSqLock, this))
+                        {
+                            IoUringUserData = 0;
+                            directResult = IoUringDirectPrepareResult.PrepareFailed;
+                        }
+                        else
+                        {
+                            // Publish SQ tail under lock — kernel can see the SQE only after this.
+                            pending = engine.FinishDirectSqeSubmission(heldSqLock);
+                        }
+                    }
+                }
+                finally
+                {
+                    heldSqLock.Exit();
+                }
+
+                // Post-lock work:
+                if (pending > 0)
+                {
+                    engine.SubmitPendingToKernel(pending);
+                }
 
                 if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
                 {
-                    heldSqLock.Exit();
                     _state = State.Complete;
                     IoUringUserData = 0;
                     context.TryCompleteIoUringOperation(this);
                     return true;
                 }
 
-                if (directResult == IoUringDirectPrepareResult.Prepared && ErrorCode == SocketError.Success)
+                if (directResult == IoUringDirectPrepareResult.Prepared)
                 {
-                    _ioUringSlotExhaustionRetryCount = 0;
-                    IoUringUserData = directUserData;
-
-                    // Track under lock — before the kernel can see the SQE.
-                    if (!engine.TryTrackDirectlySubmittedOperation(heldSqLock, this))
-                    {
-                        heldSqLock.Exit();
-                        IoUringUserData = 0;
-                        return false;
-                    }
-
-                    // Publish SQ tail + release lock.
-                    uint pending = engine.FinishDirectSqeSubmission(heldSqLock);
-                    // Submit to kernel (outside lock).
-                    if (pending > 0)
-                    {
-                        engine.SubmitPendingToKernel(pending);
-                    }
                     return true;
                 }
 
-                // PrepareFailed or Unsupported.
-                heldSqLock.Exit();
                 IoUringUserData = 0;
                 return false;
             }
