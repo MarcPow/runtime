@@ -241,6 +241,17 @@ EAGAIN never reaches userspace. Yet the hang persists.
 **This proves the bug is NOT in the EAGAIN retry path.** It's in the completion dispatch:
 a CQE arrives but the completion callback is never invoked for the waiting async operation.
 
+## Partial send fix: 17/20 pass (was 3/10)
+
+`ProcessIoUringCompletionSuccessSend` returned false for partial sends, triggering
+an EAGAIN-style retry that blocked ThreadPool threads on blocking sockets → deadlock.
+Fixed by always returning true for successful partial sends.
+
+Remaining 3/20 failures: `recvCalls=66` (always same number for 80 sends). This is
+~270KB = socket buffer size. The recv drains all available data, next recv has nothing,
+kernel FAST_POLL should wait... but the CQE never arrives. Likely a kernel-level lost
+wakeup in FAST_POLL when data arrives during poll setup.
+
 ## Currently investigating
 
 If the hang disappears with MPSC-only, the root cause is in the direct-submit path's
