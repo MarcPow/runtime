@@ -8,29 +8,12 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Microsoft.Win32.SafeHandles;
 
 namespace System.Net.Sockets
 {
     internal sealed partial class SocketAsyncContext
     {
-        private sealed class IoUringStrategy : ISocketIoStrategy
-        {
-            public static readonly IoUringStrategy Instance = new();
-
-            public void PrepareForAsyncIo(SocketAsyncContext context)
-            {
-                // Keep socket blocking. Kernel FAST_POLL handles async waiting internally.
-            }
-
-            public bool ShouldTrySynchronous<TOperation>(ref OperationQueue<TOperation> queue, SocketAsyncContext context, out int observedSequenceNumber) where TOperation : AsyncOperation
-            {
-                // Never try synchronously — send()/recv() would block the thread.
-                // Get sequence number for StartAsyncOperation but skip the sync try.
-                observedSequenceNumber = queue.GetObservedSequenceNumberForIoUringBypass();
-                return false;
-            }
-        }
-
         private const int MultishotAcceptQueueMaxSize = 4096;
         private const int PersistentMultishotRecvDataQueueMaxSize = 64;
         private const int SolSocket = 1;
@@ -267,12 +250,109 @@ namespace System.Net.Sockets
             return engine is not null && engine.IsIoUringCompletionModeEnabled;
         }
 
-        /// <summary>Sets the I/O strategy to IoUringStrategy if the registered engine uses io_uring completion mode.</summary>
+        /// <summary>Sets _isIoUringActive if the registered engine uses io_uring completion mode.</summary>
         partial void LinuxSetIoStrategyAfterRegistration(SocketAsyncEngine engine)
         {
             if (engine.IsIoUringCompletionModeEnabled)
             {
-                _ioStrategy = IoUringStrategy.Instance;
+                _isIoUringActive = true;
+            }
+        }
+
+        /// <summary>
+        /// Handles a readiness fallback event. io_uring contexts wake the event loop
+        /// to re-drain the MPSC queue instead of enqueuing to _eventQueue (which would
+        /// trigger blocking send()/recv() on the blocking socket).
+        /// </summary>
+        internal void HandleReadinessFallback(SocketAsyncEngine engine, Interop.Sys.SocketEvents events)
+        {
+            if (_isIoUringActive)
+            {
+                // Never enqueue to _eventQueue -- that triggers HandleEvents -> ProcessQueuedOperation ->
+                // TryComplete -> blocking send()/recv() on our blocking socket. Wake the event loop instead.
+                engine.WakeEventLoopForStrategy();
+            }
+            else
+            {
+                engine.EnqueueReadinessEventDirect(this, events);
+            }
+        }
+
+        /// <summary>
+        /// Wakes the io_uring event loop if this context is registered with an io_uring engine.
+        /// Called from SafeSocketHandle.TryUnblockSocket to ensure deferred cancel CQEs
+        /// (produced by shutdown/disconnect under DEFER_TASKRUN) are processed promptly.
+        /// </summary>
+        internal void WakeIoUringEventLoopIfNeeded() => _asyncEngine?.WakeIoUringEventLoopForSocketClose();
+
+        private static bool ShouldDispatchCompletionCallback(AsyncOperation operation)
+        {
+            if (operation is ConnectOperation connectOperation)
+            {
+                // Connect can hand callback ownership to a follow-up send operation;
+                // dispatch here only when connect still owns the callback.
+                return connectOperation.Buffer.Length == 0 && connectOperation.Callback is not null;
+            }
+
+            return true;
+        }
+
+        internal bool TryMigrateToEngine(int targetEngineIndex)
+        {
+            if ((uint)targetEngineIndex >= (uint)SocketAsyncEngine.EngineCount)
+            {
+                return false;
+            }
+
+            lock (_registerLock)
+            {
+                SocketAsyncEngine? currentEngine = Volatile.Read(ref _asyncEngine);
+                if (currentEngine is null)
+                {
+                    return false;
+                }
+
+                if (currentEngine.EngineIndex == targetEngineIndex)
+                {
+                    return true;
+                }
+
+                SocketAsyncEngine targetEngine = SocketAsyncEngine.GetEngineByIndex(targetEngineIndex);
+                bool addedRef = false;
+                Interop.Error error;
+                try
+                {
+                    _socket.DangerousAddRef(ref addedRef);
+                    IntPtr handle = _socket.DangerousGetHandle();
+
+                    SocketAsyncEngine.UnregisterSocket(this);
+                    if (SocketAsyncEngine.TryRegisterSocketWithEngine(handle, this, targetEngine, out error))
+                    {
+                        Volatile.Write(ref _asyncEngine, targetEngine);
+                        return true;
+                    }
+
+                    // Best-effort rollback to the previous engine if target registration fails.
+                    if (SocketAsyncEngine.TryRegisterSocketWithEngine(handle, this, currentEngine, out error))
+                    {
+                        Volatile.Write(ref _asyncEngine, currentEngine);
+                    }
+                    else
+                    {
+                        // Fail fast: socket is no longer registered with any engine.
+                        // Clear the engine reference so subsequent operations don't target stale state.
+                        Volatile.Write(ref _asyncEngine, null);
+                    }
+
+                    return false;
+                }
+                finally
+                {
+                    if (addedRef)
+                    {
+                        _socket.DangerousRelease();
+                    }
+                }
             }
         }
 
@@ -1094,6 +1174,16 @@ namespace System.Net.Sockets
                 Multishot = 2
             }
 
+            private int _ioUringCompletionCallbackQueued;
+            private int _ioUringFallbackReprepareRequested;
+            // Defined in the IoUring partial so operation constructors can compile
+            // for the linux TFM; only linux consumes the value.
+            private int _ioUringCompletionDispatchKind;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            protected void SetIoUringCompletionDispatchKind(IoUringCompletionDispatchKind kind) =>
+                _ioUringCompletionDispatchKind = (int)kind;
+
             private long _ioUringPrepareSequence;
             private int _ioUringPrepareQueued;
             private int _ioUringPreparationReusable;
@@ -1147,6 +1237,87 @@ namespace System.Net.Sockets
 
                 Volatile.Write(ref _ioUringPrepareSequence, nextPrepareSequence);
                 Volatile.Write(ref _ioUringPrepareQueued, 0);
+            }
+
+            internal void QueueIoUringCompletionCallback()
+            {
+                Debug.Assert(Event == null);
+                if (Interlocked.Exchange(ref _ioUringCompletionCallbackQueued, 1) != 0)
+                {
+                    Debug.Fail("io_uring completion callback was already queued for this operation.");
+                    return;
+                }
+
+                ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal bool TryExecuteIoUringCompletionCallback()
+            {
+                if (Interlocked.Exchange(ref _ioUringCompletionCallbackQueued, 0) == 0)
+                {
+                    return false;
+                }
+
+                InvokeCallback(allowPooling: true);
+                return true;
+            }
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal void RequestIoUringFallbackReprepare() =>
+                Volatile.Write(ref _ioUringFallbackReprepareRequested, 1);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal bool TryConsumeIoUringFallbackReprepareRequested() =>
+                Interlocked.Exchange(ref _ioUringFallbackReprepareRequested, 0) != 0;
+
+            internal bool TryCancelForTeardown()
+            {
+                return TryCancelCore(requestIoUringCancellation: false);
+            }
+
+            private bool TryCancelCore(bool requestIoUringCancellation)
+            {
+                Trace("Enter");
+
+                // Note we could be cancelling because of socket close. Regardless, we don't need the registration anymore.
+                CancellationRegistration.Dispose();
+
+                State newState;
+                while (true)
+                {
+                    State state = _state;
+                    if (state is State.Complete or State.Canceled or State.RunningWithPendingCancellation)
+                    {
+                        return false;
+                    }
+
+                    newState = (state == State.Waiting ? State.Canceled : State.RunningWithPendingCancellation);
+                    if (state == Interlocked.CompareExchange(ref _state, newState, state))
+                    {
+                        break;
+                    }
+
+                    // Race to update the state. Loop and try again.
+                }
+
+                if (newState == State.RunningWithPendingCancellation)
+                {
+                    // For in-flight io_uring operations, request best-effort kernel cancellation now.
+                    // If completion has already won, the request is benign and will be ignored.
+                    LinuxRequestIoUringCancellationIfNeeded(requestIoUringCancellation);
+                    // TryComplete will either succeed, or it will see the pending cancellation and deal with it.
+                    return false;
+                }
+
+                // Best effort: if completion-mode io_uring work was already submitted, request kernel-side cancellation now.
+                // Partial method: no-op on non-Linux; implemented in SocketAsyncContext.IoUring.Linux.cs.
+                LinuxRequestIoUringCancellationIfNeeded(requestIoUringCancellation);
+                ProcessCancellation();
+
+                // Note, we leave the operation in the OperationQueue.
+                // When we get around to processing it, we'll see it's cancelled and skip it.
+                return true;
             }
 
             /// <summary>Marks this operation as ready for SQE preparation and returns its sequence number.</summary>
@@ -3112,6 +3283,8 @@ namespace System.Net.Sockets
 
         internal sealed partial class AcceptOperation
         {
+            public int AcceptSocketAddressLength;
+
             /// <inheritdoc />
             internal override Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.Read;
@@ -3265,6 +3438,324 @@ namespace System.Net.Sockets
                 }
 
                 return true;
+            }
+        }
+
+        // ===================================================================
+        // io_uring async dispatch implementations (partial methods declared
+        // in SocketAsyncContext.Unix.cs). Each method skips SetHandleNonBlocking
+        // (socket stays blocking for FAST_POLL) and skips the synchronous try
+        // (would block on a blocking socket). Instead, the operation is
+        // unconditionally enqueued and io_uring submission happens via
+        // LinuxTryStageIoUringOperation inside StartAsyncOperation.
+        // ===================================================================
+
+        private partial SocketError IoUringAcceptAsync(Memory<byte> socketAddress, out int socketAddressLen, out IntPtr acceptedFd, Action<IntPtr, Memory<byte>, SocketError> callback, CancellationToken cancellationToken)
+        {
+            int observedSequenceNumber = _receiveQueue.GetCurrentSequenceNumber();
+
+            AcceptOperation operation = RentAcceptOperation();
+            operation.Callback = callback;
+            operation.SocketAddress = socketAddress;
+
+            if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                socketAddressLen = operation.SocketAddress.Length;
+                acceptedFd = operation.AcceptedFileDescriptor;
+                SocketError errorCode = operation.ErrorCode;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            acceptedFd = (IntPtr)(-1);
+            socketAddressLen = 0;
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringConnectAsync(Memory<byte> socketAddress, Action<int, Memory<byte>, SocketFlags, SocketError> callback, Memory<byte> buffer, out int sentBytes, CancellationToken cancellationToken)
+        {
+            // Connect is different than the usual "readiness" pattern of other operations.
+            // We need to initiate the connect before we try to complete it.
+            // Thus, always call TryStartConnect regardless of readiness.
+            SocketError errorCode;
+            int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
+            if (SocketPal.TryStartConnect(_socket, socketAddress, out errorCode, buffer.Span, false, out sentBytes))
+            {
+                _socket.RegisterConnectResult(errorCode);
+
+                int remains = buffer.Length - sentBytes;
+
+                if (errorCode == SocketError.Success && remains > 0)
+                {
+                    errorCode = SendToAsync(buffer.Slice(sentBytes), 0, remains, SocketFlags.None, Memory<byte>.Empty, ref sentBytes, callback!, default);
+                }
+                return errorCode;
+            }
+
+            var operation = new ConnectOperation(this)
+            {
+                Callback = callback,
+                SocketAddress = socketAddress,
+                Buffer = buffer.Slice(sentBytes),
+                BytesTransferred = sentBytes,
+            };
+
+            if (!_sendQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                if (operation.ErrorCode == SocketError.Success)
+                {
+                    sentBytes += operation.BytesTransferred;
+                }
+                return operation.ErrorCode;
+            }
+
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringReceiveAsync(Memory<byte> buffer, SocketFlags flags, out int bytesReceived, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
+        {
+            int observedSequenceNumber = _receiveQueue.GetCurrentSequenceNumber();
+
+            BufferMemoryReceiveOperation operation = RentBufferMemoryReceiveOperation();
+            operation.SetReceivedFlags = false;
+            operation.Callback = callback;
+            operation.Buffer = buffer;
+            operation.Flags = flags;
+            operation.SocketAddress = default;
+
+            if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                bytesReceived = operation.BytesTransferred;
+                SocketError errorCode = operation.ErrorCode;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            bytesReceived = 0;
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringReceiveFromAsync(Memory<byte> buffer, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
+        {
+            int observedSequenceNumber = _receiveQueue.GetCurrentSequenceNumber();
+
+            BufferMemoryReceiveOperation operation = RentBufferMemoryReceiveOperation();
+            operation.SetReceivedFlags = true;
+            operation.Callback = callback;
+            operation.Buffer = buffer;
+            operation.Flags = flags;
+            operation.SocketAddress = socketAddress;
+
+            if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                receivedFlags = operation.ReceivedFlags;
+                bytesReceived = operation.BytesTransferred;
+                SocketError errorCode = operation.ErrorCode;
+                socketAddressLen = operation.SocketAddress.Length;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            bytesReceived = 0;
+            socketAddressLen = 0;
+            receivedFlags = SocketFlags.None;
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringReceiveFromAsync(IList<ArraySegment<byte>> buffers, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, out int bytesReceived, out SocketFlags receivedFlags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        {
+            int observedSequenceNumber = _receiveQueue.GetCurrentSequenceNumber();
+
+            BufferListReceiveOperation operation = RentBufferListReceiveOperation();
+            operation.Callback = callback;
+            operation.Buffers = buffers;
+            operation.Flags = flags;
+            operation.SocketAddress = socketAddress;
+
+            if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber))
+            {
+                socketAddressLen = operation.SocketAddress.Length;
+                receivedFlags = operation.ReceivedFlags;
+                bytesReceived = operation.BytesTransferred;
+                SocketError errorCode = operation.ErrorCode;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            receivedFlags = SocketFlags.None;
+            socketAddressLen = 0;
+            bytesReceived = 0;
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringReceiveMessageFromAsync(Memory<byte> buffer, IList<ArraySegment<byte>>? buffers, SocketFlags flags, Memory<byte> socketAddress, out int socketAddressLen, bool isIPv4, bool isIPv6, out int bytesReceived, out SocketFlags receivedFlags, out IPPacketInformation ipPacketInformation, Action<int, Memory<byte>, SocketFlags, IPPacketInformation, SocketError> callback, CancellationToken cancellationToken)
+        {
+            int observedSequenceNumber = _receiveQueue.GetCurrentSequenceNumber();
+
+            var operation = new ReceiveMessageFromOperation(this)
+            {
+                Callback = callback,
+                Buffer = buffer,
+                Buffers = buffers,
+                Flags = flags,
+                SocketAddress = socketAddress,
+                IsIPv4 = isIPv4,
+                IsIPv6 = isIPv6,
+            };
+
+            if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                socketAddressLen = operation.SocketAddress.Length;
+                receivedFlags = operation.ReceivedFlags;
+                ipPacketInformation = operation.IPPacketInformation;
+                bytesReceived = operation.BytesTransferred;
+                return operation.ErrorCode;
+            }
+
+            ipPacketInformation = default(IPPacketInformation);
+            bytesReceived = 0;
+            socketAddressLen = 0;
+            receivedFlags = SocketFlags.None;
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringSendToAsync(Memory<byte> buffer, int offset, int count, SocketFlags flags, Memory<byte> socketAddress, ref int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
+        {
+            int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
+
+            BufferMemorySendOperation operation = RentBufferMemorySendOperation();
+            operation.Callback = callback;
+            operation.Buffer = buffer;
+            operation.Offset = offset;
+            operation.Count = count;
+            operation.Flags = flags;
+            operation.SocketAddress = socketAddress;
+            operation.BytesTransferred = bytesSent;
+
+            if (!_sendQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                bytesSent = operation.BytesTransferred;
+                SocketError errorCode = operation.ErrorCode;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringSendToAsync(IList<ArraySegment<byte>> buffers, SocketFlags flags, Memory<byte> socketAddress, out int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        {
+            bytesSent = 0;
+            int bufferIndex = 0;
+            int offset = 0;
+            int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
+
+            BufferListSendOperation operation = RentBufferListSendOperation();
+            operation.Callback = callback;
+            operation.Buffers = buffers;
+            operation.BufferIndex = bufferIndex;
+            operation.Offset = offset;
+            operation.Flags = flags;
+            operation.SocketAddress = socketAddress;
+            operation.BytesTransferred = bytesSent;
+
+            if (!_sendQueue.StartAsyncOperation(this, operation, observedSequenceNumber))
+            {
+                bytesSent = operation.BytesTransferred;
+                SocketError errorCode = operation.ErrorCode;
+
+                ReturnOperation(operation);
+                return errorCode;
+            }
+
+            return SocketError.IOPending;
+        }
+
+        private partial SocketError IoUringSendFileAsync(SafeFileHandle fileHandle, long offset, long count, out long bytesSent, Action<long, SocketError> callback, CancellationToken cancellationToken)
+        {
+            bytesSent = 0;
+            int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
+
+            var operation = new SendFileOperation(this)
+            {
+                Callback = callback,
+                FileHandle = fileHandle,
+                Offset = offset,
+                Count = count,
+                BytesTransferred = bytesSent
+            };
+
+            if (!_sendQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
+            {
+                bytesSent = operation.BytesTransferred;
+                return operation.ErrorCode;
+            }
+
+            return SocketError.IOPending;
+        }
+
+        private partial struct OperationQueue<TOperation>
+            where TOperation : AsyncOperation
+        {
+            /// <summary>Returns the current sequence number for io_uring callers that skip the IsReady check.</summary>
+            public int GetCurrentSequenceNumber() => Volatile.Read(ref _sequenceNumber);
+
+            public bool TryRemoveCompletedOperation(SocketAsyncContext context, TOperation operation)
+            {
+                using (Lock())
+                {
+                    if (_tail == null || _state == QueueState.Stopped)
+                    {
+                        return false;
+                    }
+
+                    AsyncOperation? previous = _tail;
+                    AsyncOperation? current = _tail.Next;
+                    while (!ReferenceEquals(current, operation))
+                    {
+                        if (ReferenceEquals(current, _tail))
+                        {
+                            return false;
+                        }
+
+                        previous = current;
+                        current = current!.Next;
+                    }
+
+                    Debug.Assert(previous != null && current != null);
+                    bool removedHead = ReferenceEquals(current, _tail.Next);
+                    bool removedTail = ReferenceEquals(current, _tail);
+
+                    if (removedHead && removedTail)
+                    {
+                        _tail = null;
+                        _isNextOperationSynchronous = false;
+                        _state = QueueState.Ready;
+                        _sequenceNumber++;
+                        Trace(context, $"Removed completed {IdOf(operation)} (queue empty)");
+                        return true;
+                    }
+
+                    previous!.Next = current!.Next;
+                    if (removedTail)
+                    {
+                        _tail = (TOperation)previous;
+                    }
+
+                    if (removedHead)
+                    {
+                        Debug.Assert(_tail != null);
+                        _isNextOperationSynchronous = _tail.Next.Event != null;
+                    }
+
+                    Trace(context, $"Removed completed {IdOf(operation)}");
+                    return true;
+                }
             }
         }
     }
