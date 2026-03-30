@@ -14,234 +14,20 @@ namespace System.Net.Sockets
 {
     internal sealed partial class SocketAsyncContext
     {
-        private const int MultishotAcceptQueueMaxSize = 4096;
-        private const int PersistentMultishotRecvDataQueueMaxSize = 64;
-        private const int SolSocket = 1;
-        private const int SoIncomingCpu = 49;
-        private const int SoReusePort = 15;
-        private const int IoUringUserDataTagShift = 56;
-        private const byte IoUringReservedCompletionTag = 2;
-        private const long MultishotAcceptStateDisarmed = 0;
-        private const long MultishotAcceptStateArming = 1;
-        private Queue<PreAcceptedConnection>? _multishotAcceptQueue;
-        private int _migrationState; // 0=unchecked, 1=checking, 2=done
-        private long _multishotAcceptState; // 0=disarmed, 1=arming, otherwise encoded reserved-completion user_data
-        private ulong _persistentMultishotRecvUserData; // user_data of armed multishot recv SQE
-        private int _persistentMultishotRecvArmed; // 0=not armed, 1=armed
-        private Queue<BufferedPersistentMultishotRecvData>? _persistentMultishotRecvDataQueue;
-        private BufferedPersistentMultishotRecvData _persistentMultishotRecvDataHead;
-        private bool _hasPersistentMultishotRecvDataHead;
-        private int _persistentMultishotRecvDataHeadOffset;
-        private Lock? _multishotAcceptQueueGate;
-        private Lock? _persistentMultishotRecvDataGate;
-        private Lock? _reusePortShadowListenersGate;
-        private ReusePortShadowListenerState[]? _reusePortShadowListeners;
+        // io_uring SQE opcode constants (mirror kernel UAPI values).
+        // Duplicated here because IoUringOpcodes is private inside SocketAsyncEngine.
+        private const byte IoUringOpSend = 26;
+        private const byte IoUringOpRecv = 27;
+        private const byte IoUringOpSendMsg = 9;
+        private const byte IoUringOpRecvMsg = 10;
+        private const byte IoUringOpAccept = 13;
+        private const byte IoUringOpConnect = 16;
 
-        /// <summary>Tracks a SO_REUSEPORT shadow listener socket armed on a non-primary engine.</summary>
-        private struct ReusePortShadowListenerState
-        {
-            internal SafeSocketHandle Handle;
-            internal int EngineIndex;
-            internal ulong ArmedUserData;
-        }
+        // io_uring ioprio flags
+        private const ushort IoUringRecvSendPollFirst = 1 << 0;
 
-        private readonly struct BufferedPersistentMultishotRecvData
-        {
-            internal readonly byte[] Data;
-            internal readonly int Length;
-            internal readonly bool UsesPooledBuffer;
-
-            internal BufferedPersistentMultishotRecvData(byte[] data, int length, bool usesPooledBuffer)
-            {
-                Data = data;
-                Length = length;
-                UsesPooledBuffer = usesPooledBuffer;
-            }
-        }
-
-        /// <summary>Holds a pre-accepted connection's fd and socket address from a multishot accept CQE.</summary>
-        private readonly struct PreAcceptedConnection
-        {
-            internal readonly IntPtr FileDescriptor;
-            internal readonly byte[] SocketAddressData;
-            internal readonly int SocketAddressLength;
-            internal readonly bool UsesPooledBuffer;
-
-            internal PreAcceptedConnection(IntPtr fileDescriptor, byte[] socketAddressData, int socketAddressLength, bool usesPooledBuffer)
-            {
-                FileDescriptor = fileDescriptor;
-                SocketAddressData = socketAddressData;
-                SocketAddressLength = socketAddressLength;
-                UsesPooledBuffer = usesPooledBuffer;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Lock EnsureMultishotAcceptQueueGate() => EnsureLockInitialized(ref _multishotAcceptQueueGate);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Lock EnsurePersistentMultishotRecvDataGate() => EnsureLockInitialized(ref _persistentMultishotRecvDataGate);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Lock EnsureReusePortShadowListenersGate() => EnsureLockInitialized(ref _reusePortShadowListenersGate);
-
-        private bool IsPrimarySocketReusePortEnabled()
-        {
-            Span<byte> value = stackalloc byte[sizeof(int)];
-            int valueLength = sizeof(int);
-            SocketError error = SocketPal.GetRawSockOpt(_socket, SolSocket, SoReusePort, value, ref valueLength);
-            if (error != SocketError.Success || valueLength < sizeof(int))
-            {
-                return false;
-            }
-
-            return BitConverter.ToInt32(value) != 0;
-        }
-
-        private void AddReusePortShadowListener(ref ReusePortShadowListenerState state)
-        {
-            Lock gate = EnsureReusePortShadowListenersGate();
-            lock (gate)
-            {
-                ReusePortShadowListenerState[]? existing = _reusePortShadowListeners;
-                if (existing is null)
-                {
-                    _reusePortShadowListeners = [state];
-                    return;
-                }
-
-                var updated = new ReusePortShadowListenerState[existing.Length + 1];
-                Array.Copy(existing, updated, existing.Length);
-                updated[^1] = state;
-                _reusePortShadowListeners = updated;
-            }
-        }
-
-        private void RemoveReusePortShadowListenerByEngineIndex(int engineIndex)
-        {
-            Lock gate = EnsureReusePortShadowListenersGate();
-            lock (gate)
-            {
-                ReusePortShadowListenerState[]? existing = _reusePortShadowListeners;
-                if (existing is null || existing.Length == 0)
-                {
-                    return;
-                }
-
-                int removeIndex = -1;
-                for (int i = 0; i < existing.Length; i++)
-                {
-                    if (existing[i].EngineIndex == engineIndex)
-                    {
-                        removeIndex = i;
-                        break;
-                    }
-                }
-
-                if (removeIndex < 0)
-                {
-                    return;
-                }
-
-                if (existing.Length == 1)
-                {
-                    _reusePortShadowListeners = null;
-                    return;
-                }
-
-                var updated = new ReusePortShadowListenerState[existing.Length - 1];
-                if (removeIndex > 0)
-                {
-                    Array.Copy(existing, 0, updated, 0, removeIndex);
-                }
-
-                if (removeIndex < existing.Length - 1)
-                {
-                    Array.Copy(existing, removeIndex + 1, updated, removeIndex, existing.Length - removeIndex - 1);
-                }
-
-                _reusePortShadowListeners = updated;
-            }
-        }
-
-        private static bool TryGetIncomingCpu(SafeSocketHandle socket, out int cpu)
-        {
-            cpu = -1;
-            Span<byte> value = stackalloc byte[sizeof(int)];
-            int valueLength = sizeof(int);
-            SocketError error = SocketPal.GetRawSockOpt(socket, SolSocket, SoIncomingCpu, value, ref valueLength);
-            if (error != SocketError.Success || valueLength < sizeof(int))
-            {
-                return false;
-            }
-
-            cpu = BitConverter.ToInt32(value);
-            return cpu >= 0;
-        }
-
-        private void TryMigrateIoUringEngineOnFirstReceiveCompletion()
-        {
-            if (Interlocked.CompareExchange(ref _migrationState, 1, 0) != 0)
-            {
-                return;
-            }
-
-            try
-            {
-                SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
-                if (engine is null || !engine.IsIoUringCompletionModeEnabled || IsPersistentMultishotRecvArmed())
-                {
-                    return;
-                }
-
-                if (!TryGetIncomingCpu(_socket, out int incomingCpu))
-                {
-                    return;
-                }
-
-                int targetEngineIndex = SocketAsyncEngine.GetEngineIndexForCpu(incomingCpu);
-                if (targetEngineIndex < 0 || targetEngineIndex == engine.EngineIndex)
-                {
-                    return;
-                }
-
-                _ = TryMigrateToEngine(targetEngineIndex);
-            }
-            finally
-            {
-                Volatile.Write(ref _migrationState, 2);
-            }
-        }
-
-        private int PersistentMultishotRecvBufferedCount =>
-            (_persistentMultishotRecvDataQueue?.Count ?? 0) + (_hasPersistentMultishotRecvDataHead ? 1 : 0);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Lock EnsureLockInitialized(ref Lock? gate)
-        {
-            Lock? existing = Volatile.Read(ref gate);
-            if (existing is not null)
-            {
-                return existing;
-            }
-
-            Lock created = new Lock();
-            Lock? prior = Interlocked.CompareExchange(ref gate, created, null);
-            return prior ?? created;
-        }
-
-        /// <summary>Returns the raw socket fd for POLL_ADD SQE submission. Returns -1 if unavailable.</summary>
-        internal int GetSocketFdForPoll()
-        {
-            try
-            {
-                return (int)(nint)_socket.DangerousGetHandle();
-            }
-            catch (ObjectDisposedException)
-            {
-                return -1;
-            }
-        }
+        // Accept-time flags: SOCK_CLOEXEC | SOCK_NONBLOCK
+        private const uint IoUringAcceptFlags = 0x80800;
 
         /// <summary>Returns whether this context's engine is using io_uring completion mode.</summary>
         private bool IsIoUringCompletionModeEnabled()
@@ -260,582 +46,13 @@ namespace System.Net.Sockets
         }
 
         /// <summary>
-        /// Handles a readiness fallback event. io_uring contexts wake the event loop
-        /// to re-drain the MPSC queue instead of enqueuing to _eventQueue (which would
-        /// trigger blocking send()/recv() on the blocking socket).
+        /// Called from SafeSocketHandle to ensure deferred cancel CQEs are processed.
+        /// In the simplified engine, this is a no-op since we use eventfd-based epoll wakeup.
         /// </summary>
-        internal void HandleReadinessFallback(SocketAsyncEngine engine, Interop.Sys.SocketEvents events)
+        internal void WakeIoUringEventLoopIfNeeded()
         {
-            if (_isIoUringActive)
-            {
-                // Never enqueue to _eventQueue -- that triggers HandleEvents -> ProcessQueuedOperation ->
-                // TryComplete -> blocking send()/recv() on our blocking socket. Wake the event loop instead.
-                engine.WakeEventLoopForStrategy();
-            }
-            else
-            {
-                engine.EnqueueReadinessEventDirect(this, events);
-            }
-        }
-
-        /// <summary>
-        /// Wakes the io_uring event loop if this context is registered with an io_uring engine.
-        /// Called from SafeSocketHandle.TryUnblockSocket to ensure deferred cancel CQEs
-        /// (produced by shutdown/disconnect under DEFER_TASKRUN) are processed promptly.
-        /// </summary>
-        internal void WakeIoUringEventLoopIfNeeded() => _asyncEngine?.WakeIoUringEventLoopForSocketClose();
-
-        private static bool ShouldDispatchCompletionCallback(AsyncOperation operation)
-        {
-            if (operation is ConnectOperation connectOperation)
-            {
-                // Connect can hand callback ownership to a follow-up send operation;
-                // dispatch here only when connect still owns the callback.
-                return connectOperation.Buffer.Length == 0 && connectOperation.Callback is not null;
-            }
-
-            return true;
-        }
-
-        internal bool TryMigrateToEngine(int targetEngineIndex)
-        {
-            if ((uint)targetEngineIndex >= (uint)SocketAsyncEngine.EngineCount)
-            {
-                return false;
-            }
-
-            lock (_registerLock)
-            {
-                SocketAsyncEngine? currentEngine = Volatile.Read(ref _asyncEngine);
-                if (currentEngine is null)
-                {
-                    return false;
-                }
-
-                if (currentEngine.EngineIndex == targetEngineIndex)
-                {
-                    return true;
-                }
-
-                SocketAsyncEngine targetEngine = SocketAsyncEngine.GetEngineByIndex(targetEngineIndex);
-                bool addedRef = false;
-                Interop.Error error;
-                try
-                {
-                    _socket.DangerousAddRef(ref addedRef);
-                    IntPtr handle = _socket.DangerousGetHandle();
-
-                    SocketAsyncEngine.UnregisterSocket(this);
-                    if (SocketAsyncEngine.TryRegisterSocketWithEngine(handle, this, targetEngine, out error))
-                    {
-                        Volatile.Write(ref _asyncEngine, targetEngine);
-                        return true;
-                    }
-
-                    // Best-effort rollback to the previous engine if target registration fails.
-                    if (SocketAsyncEngine.TryRegisterSocketWithEngine(handle, this, currentEngine, out error))
-                    {
-                        Volatile.Write(ref _asyncEngine, currentEngine);
-                    }
-                    else
-                    {
-                        // Fail fast: socket is no longer registered with any engine.
-                        // Clear the engine reference so subsequent operations don't target stale state.
-                        Volatile.Write(ref _asyncEngine, null);
-                    }
-
-                    return false;
-                }
-                finally
-                {
-                    if (addedRef)
-                    {
-                        _socket.DangerousRelease();
-                    }
-                }
-            }
-        }
-
-        /// <summary>Returns the total count of non-pinnable buffer prepare fallbacks across active engines.</summary>
-        internal static long GetIoUringNonPinnablePrepareFallbackCount() =>
-            SocketAsyncEngine.GetIoUringNonPinnablePrepareFallbackCount();
-
-        /// <summary>Test-only setter for the non-pinnable fallback counter.</summary>
-        internal static void SetIoUringNonPinnablePrepareFallbackCountForTest(long value) =>
-            SocketAsyncEngine.SetIoUringNonPinnablePrepareFallbackCountForTest(value);
-
-        private static SocketAsyncContext? GetContextForTest(Socket socket)
-        {
-            try { return socket.SafeHandle.AsyncContext; }
-            catch (ObjectDisposedException) { return null; }
-        }
-
-        internal static bool TryGetSocketAsyncContextForTest(Socket socket, out SocketAsyncContext? context)
-        {
-            context = GetContextForTest(socket);
-            return context is not null;
-        }
-
-        internal static int GetReusePortShadowListenerCountForTest(Socket socket) =>
-            GetContextForTest(socket)?._reusePortShadowListeners?.Length ?? 0;
-
-        internal static bool IsMultishotAcceptArmedForTest(Socket socket) =>
-            GetContextForTest(socket)?.IsMultishotAcceptArmed ?? false;
-
-        internal static int GetMultishotAcceptQueueCountForTest(Socket socket)
-        {
-            SocketAsyncContext? context = GetContextForTest(socket);
-            if (context is null) return 0;
-            Lock gate = context.EnsureMultishotAcceptQueueGate();
-            lock (gate) { return context._multishotAcceptQueue?.Count ?? 0; }
-        }
-
-        internal static bool TryGetIncomingCpuForTest(Socket socket, out int cpu)
-        {
-            cpu = -1;
-            SocketAsyncContext? context = GetContextForTest(socket);
-            return context is not null && TryGetIncomingCpu(context._socket, out cpu);
-        }
-
-        internal static bool IsPersistentMultishotRecvArmedForTest(Socket socket) =>
-            GetContextForTest(socket)?.IsPersistentMultishotRecvArmed() ?? false;
-
-        internal static ulong GetPersistentMultishotRecvUserDataForTest(Socket socket)
-        {
-            SocketAsyncContext? context = GetContextForTest(socket);
-            return context is not null && context.IsPersistentMultishotRecvArmed()
-                ? context.PersistentMultishotRecvUserData : 0;
-        }
-
-        internal static int GetPersistentMultishotRecvBufferedCountForTest(Socket socket)
-        {
-            SocketAsyncContext? context = GetContextForTest(socket);
-            if (context is null) return 0;
-            Lock gate = context.EnsurePersistentMultishotRecvDataGate();
-            lock (gate) { return context.PersistentMultishotRecvBufferedCount; }
-        }
-
-        internal int GetPersistentMultishotRecvBufferedCountForDiagnostics()
-        {
-            Lock gate = EnsurePersistentMultishotRecvDataGate();
-            lock (gate)
-            {
-                return PersistentMultishotRecvBufferedCount;
-            }
-        }
-
-        /// <summary>Test-only wrapper accepting byte[] to avoid Span reflection limitations.</summary>
-        internal bool TryBufferEarlyPersistentMultishotRecvDataForTest(byte[] payload) =>
-            TryBufferEarlyPersistentMultishotRecvData(payload);
-
-        /// <summary>Returns whether a multishot accept SQE is currently armed for this context.</summary>
-        internal bool IsMultishotAcceptArmed => Volatile.Read(ref _multishotAcceptState) != MultishotAcceptStateDisarmed;
-
-        /// <summary>Returns the user_data payload for the armed multishot accept SQE, if any.</summary>
-        internal ulong MultishotAcceptUserData => DecodeMultishotAcceptUserData(Volatile.Read(ref _multishotAcceptState));
-
-        /// <summary>Clears multishot accept armed-state for this context.</summary>
-        internal void DisarmMultishotAccept()
-        {
-            Volatile.Write(ref _multishotAcceptState, MultishotAcceptStateDisarmed);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static ulong DecodeMultishotAcceptUserData(long packedState)
-        {
-            ulong rawState = (ulong)packedState;
-            return (byte)(rawState >> IoUringUserDataTagShift) == IoUringReservedCompletionTag
-                ? rawState
-                : 0;
-        }
-
-        /// <summary>Returns whether a persistent multishot recv SQE is currently armed for this context.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal bool IsPersistentMultishotRecvArmed() =>
-            Volatile.Read(ref _persistentMultishotRecvArmed) != 0;
-
-        /// <summary>Records that a persistent multishot recv SQE has been armed for this context.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void SetPersistentMultishotRecvArmed(ulong userData)
-        {
-            Volatile.Write(ref _persistentMultishotRecvUserData, userData);
-            Volatile.Write(ref _persistentMultishotRecvArmed, 1);
-        }
-
-        /// <summary>Clears this context's armed persistent multishot recv state.</summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void ClearPersistentMultishotRecvArmed()
-        {
-            Volatile.Write(ref _persistentMultishotRecvUserData, 0);
-            Volatile.Write(ref _persistentMultishotRecvArmed, 0);
-        }
-
-        /// <summary>Gets the user_data of the armed persistent multishot recv SQE, or 0 if none is armed.</summary>
-        internal ulong PersistentMultishotRecvUserData =>
-            Volatile.Read(ref _persistentMultishotRecvUserData);
-
-        /// <summary>
-        /// Clears persistent multishot recv armed-state and requests ASYNC_CANCEL for
-        /// the armed user_data when available.
-        /// </summary>
-        internal void RequestPersistentMultishotRecvCancel()
-        {
-            ulong recvUserData = Volatile.Read(ref _persistentMultishotRecvUserData);
-            ClearPersistentMultishotRecvArmed();
-            if (recvUserData != 0)
-            {
-                SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
-                engine?.TryRequestIoUringCancellation(recvUserData);
-            }
-        }
-
-        /// <summary>Copies an early multishot-recv payload into the per-socket replay queue.</summary>
-        internal bool TryBufferEarlyPersistentMultishotRecvData(ReadOnlySpan<byte> payload)
-        {
-            if (payload.Length == 0)
-            {
-                return true;
-            }
-
-            EnsurePersistentMultishotRecvDataQueueInitialized();
-            Queue<BufferedPersistentMultishotRecvData>? queue = _persistentMultishotRecvDataQueue;
-            if (queue is null)
-            {
-                return false;
-            }
-
-            byte[] copy = ArrayPool<byte>.Shared.Rent(payload.Length);
-            payload.CopyTo(copy);
-            Lock gate = EnsurePersistentMultishotRecvDataGate();
-            lock (gate)
-            {
-                if (PersistentMultishotRecvBufferedCount >= PersistentMultishotRecvDataQueueMaxSize)
-                {
-                    ArrayPool<byte>.Shared.Return(copy);
-                    return false;
-                }
-
-                // Publish queue count only after enqueue to avoid teardown observing phantom items.
-                queue.Enqueue(new BufferedPersistentMultishotRecvData(copy, payload.Length, usesPooledBuffer: true));
-            }
-
-            return true;
-        }
-
-        /// <summary>Attempts to drain buffered multishot-recv payload into the caller destination.</summary>
-        internal bool TryConsumeBufferedPersistentMultishotRecvData(Memory<byte> destination, out int bytesTransferred)
-        {
-            bytesTransferred = 0;
-            if (destination.Length == 0)
-            {
-                return false;
-            }
-
-            Lock gate = EnsurePersistentMultishotRecvDataGate();
-            byte[] sourceBuffer;
-            int sourceOffset;
-            int toCopy;
-            bool releaseHeadAfterCopy;
-            BufferedPersistentMultishotRecvData sourceHead;
-            lock (gate)
-            {
-                if (!TryAcquirePersistentMultishotRecvDataHead(out BufferedPersistentMultishotRecvData buffered))
-                {
-                    return false;
-                }
-
-                int headOffset = _persistentMultishotRecvDataHeadOffset;
-                int remaining = buffered.Length - headOffset;
-                Debug.Assert(remaining > 0);
-                if (remaining <= 0)
-                {
-                    ReleasePersistentMultishotRecvDataHead();
-                    return false;
-                }
-
-                toCopy = Math.Min(destination.Length, remaining);
-                sourceBuffer = buffered.Data;
-                sourceOffset = headOffset;
-                sourceHead = buffered;
-                _persistentMultishotRecvDataHeadOffset = headOffset + toCopy;
-                releaseHeadAfterCopy = _persistentMultishotRecvDataHeadOffset >= buffered.Length;
-            }
-
-            sourceBuffer.AsSpan(sourceOffset, toCopy).CopyTo(destination.Span);
-            bytesTransferred = toCopy;
-
-            if (releaseHeadAfterCopy)
-            {
-                lock (gate)
-                {
-                    if (_hasPersistentMultishotRecvDataHead &&
-                        _persistentMultishotRecvDataHead.Length == sourceHead.Length &&
-                        ReferenceEquals(_persistentMultishotRecvDataHead.Data, sourceHead.Data) &&
-                        _persistentMultishotRecvDataHeadOffset >= sourceHead.Length)
-                    {
-                        ReleasePersistentMultishotRecvDataHead();
-                    }
-                }
-            }
-
-            return true;
-        }
-
-        /// <summary>Ensures the pre-accepted connection queue exists.</summary>
-        private void EnsureMultishotAcceptQueueInitialized()
-        {
-            if (_multishotAcceptQueue is null)
-            {
-                Lock gate = EnsureMultishotAcceptQueueGate();
-                lock (gate)
-                {
-                    _multishotAcceptQueue ??= new Queue<PreAcceptedConnection>();
-                }
-            }
-        }
-
-        /// <summary>
-        /// Attempts to enqueue a pre-accepted connection from a multishot accept CQE.
-        /// Caller is responsible for closing <paramref name="acceptedFd"/> when this returns false.
-        /// </summary>
-        internal bool TryEnqueuePreAcceptedConnection(IntPtr acceptedFd, ReadOnlySpan<byte> socketAddressData, int socketAddressLen)
-        {
-            EnsureMultishotAcceptQueueInitialized();
-            Queue<PreAcceptedConnection>? queue = _multishotAcceptQueue;
-            if (queue is null)
-            {
-                return false;
-            }
-
-            int length = socketAddressLen;
-            if (length < 0)
-            {
-                length = 0;
-            }
-
-            if ((uint)length > (uint)socketAddressData.Length)
-            {
-                length = socketAddressData.Length;
-            }
-
-            Lock gate = EnsureMultishotAcceptQueueGate();
-            lock (gate)
-            {
-                if (queue.Count >= MultishotAcceptQueueMaxSize)
-                {
-                    return false;
-                }
-
-                byte[] copy;
-                if (length != 0)
-                {
-                    copy = ArrayPool<byte>.Shared.Rent(length);
-                    socketAddressData.Slice(0, length).CopyTo(copy);
-                }
-                else
-                {
-                    copy = Array.Empty<byte>();
-                }
-
-                queue.Enqueue(new PreAcceptedConnection(acceptedFd, copy, length, usesPooledBuffer: length != 0));
-            }
-
-            return true;
-        }
-
-        /// <summary>
-        /// Attempts to dequeue a pre-accepted connection from the multishot accept queue.
-        /// Returns true if a connection was available, populating the operation fields.
-        /// </summary>
-        internal bool TryDequeuePreAcceptedConnection(AcceptOperation operation)
-        {
-            EnsureMultishotAcceptQueueInitialized();
-            Queue<PreAcceptedConnection>? queue = _multishotAcceptQueue;
-            if (queue is null)
-            {
-                return false;
-            }
-
-            PreAcceptedConnection accepted;
-            Lock gate = EnsureMultishotAcceptQueueGate();
-            lock (gate)
-            {
-                if (queue.Count == 0)
-                {
-                    return false;
-                }
-
-                accepted = queue.Dequeue();
-            }
-
-            try
-            {
-                operation.AcceptedFileDescriptor = accepted.FileDescriptor;
-                int socketAddressLen = accepted.SocketAddressLength;
-                if ((uint)socketAddressLen > (uint)operation.SocketAddress.Length)
-                {
-                    socketAddressLen = operation.SocketAddress.Length;
-                }
-
-                if (socketAddressLen != 0)
-                {
-                    accepted.SocketAddressData.AsSpan(0, socketAddressLen).CopyTo(operation.SocketAddress.Span);
-                }
-
-                operation.AcceptSocketAddressLength = socketAddressLen;
-                operation.SocketAddress = operation.SocketAddress.Slice(0, socketAddressLen);
-                operation.ErrorCode = SocketError.Success;
-                return true;
-            }
-            finally
-            {
-                ReturnPooledBufferIfNeeded(accepted.SocketAddressData, accepted.UsesPooledBuffer);
-            }
-        }
-
-        /// <summary>Records that a shadow listener's multishot accept SQE was armed on the specified engine.</summary>
-        internal void RecordReusePortShadowArmed(ulong userData, int engineIndex)
-        {
-            Lock gate = EnsureReusePortShadowListenersGate();
-            lock (gate)
-            {
-                ReusePortShadowListenerState[]? shadows = _reusePortShadowListeners;
-                if (shadows is null)
-                {
-                    return;
-                }
-
-                for (int i = 0; i < shadows.Length; i++)
-                {
-                    if (shadows[i].EngineIndex == engineIndex)
-                    {
-                        shadows[i].ArmedUserData = userData;
-                        return;
-                    }
-                }
-            }
-        }
-
-        /// <summary>
-        /// Creates SO_REUSEPORT shadow listener sockets on non-primary engines to distribute
-        /// incoming connections across all io_uring engines. Called after primary multishot accept
-        /// is successfully armed.
-        /// </summary>
-        internal unsafe void TryCreateReusePortShadowListeners(SocketAsyncEngine primaryEngine)
-        {
-            if (SocketAsyncEngine.IsReusePortAcceptDisabled() || SocketAsyncEngine.EngineCount <= 1)
-            {
-                return;
-            }
-
-            // Get the primary socket's bound address via getsockname.
-            byte* sockAddrBuffer = stackalloc byte[128]; // large enough for sockaddr_storage
-            int sockAddrLen = 128;
-            Interop.Error getSockNameErr = Interop.Sys.GetSockName(_socket, sockAddrBuffer, &sockAddrLen);
-            if (getSockNameErr != Interop.Error.SUCCESS || sockAddrLen <= 0)
-            {
-                return;
-            }
-
-            ReadOnlySpan<byte> boundAddress = new ReadOnlySpan<byte>(sockAddrBuffer, sockAddrLen);
-
-            // Determine socket family, type, protocol from the primary socket.
-            Interop.Error getTypeErr = Interop.Sys.GetSocketType(
-                _socket,
-                out AddressFamily addressFamily,
-                out SocketType socketType,
-                out ProtocolType protocolType,
-                out bool _);
-            if (getTypeErr != Interop.Error.SUCCESS)
-            {
-                return;
-            }
-
-            // SO_REUSEPORT must be enabled before the primary bind/listen sequence.
-            // If the primary wasn't created with REUSEPORT, shadow binds to the same endpoint
-            // won't join the reuseport group and will fail with EADDRINUSE.
-            if (!IsPrimarySocketReusePortEnabled())
-            {
-                return;
-            }
-
-            SocketAsyncEngine.EnsureFdEngineAffinityTable();
-
-            int engineCount = SocketAsyncEngine.EngineCount;
-            for (int i = 0; i < engineCount; i++)
-            {
-                SocketAsyncEngine targetEngine = SocketAsyncEngine.GetEngineByIndex(i);
-                if (targetEngine == primaryEngine)
-                {
-                    continue;
-                }
-
-                // Create shadow socket.
-                IntPtr shadowFd;
-                Interop.Error socketErr = Interop.Sys.Socket(
-                    (int)addressFamily, (int)socketType, (int)protocolType, &shadowFd);
-                if (socketErr != Interop.Error.SUCCESS)
-                {
-                    continue;
-                }
-
-                SafeSocketHandle shadowHandle = new SafeSocketHandle();
-                Marshal.InitHandle(shadowHandle, shadowFd);
-
-                bool shadowCreated = false;
-                try
-                {
-                    // Set SO_REUSEPORT.
-                    int reusePort = 1;
-                    Interop.Error setOptErr = Interop.Sys.SetRawSockOpt(
-                        shadowHandle, SolSocket, SoReusePort, (byte*)&reusePort, sizeof(int));
-                    if (setOptErr != Interop.Error.SUCCESS)
-                    {
-                        continue;
-                    }
-
-                    // Bind to same address.
-                    Interop.Error bindErr = Interop.Sys.Bind(shadowHandle, protocolType, boundAddress);
-                    if (bindErr != Interop.Error.SUCCESS)
-                    {
-                        continue;
-                    }
-
-                    // Listen.
-                    Interop.Error listenErr = Interop.Sys.Listen(shadowHandle, 512);
-                    if (listenErr != Interop.Error.SUCCESS)
-                    {
-                        continue;
-                    }
-
-                    // Enqueue setup request to target engine (SQE arming happens on its event loop).
-                    ReusePortShadowListenerState state = new ReusePortShadowListenerState
-                    {
-                        Handle = shadowHandle,
-                        EngineIndex = i,
-                        ArmedUserData = 0
-                    };
-
-                    // Publish the shadow state before enqueuing setup so RecordReusePortShadowArmed
-                    // can always resolve and persist armed user_data from the target event loop.
-                    AddReusePortShadowListener(ref state);
-                    if (targetEngine.TryEnqueueReusePortShadowSetup(shadowHandle, this, primaryEngine))
-                    {
-                        shadowCreated = true;
-                    }
-                    else
-                    {
-                        RemoveReusePortShadowListenerByEngineIndex(i);
-                    }
-                }
-                finally
-                {
-                    if (!shadowCreated)
-                    {
-                        shadowHandle.Dispose();
-                    }
-                }
-            }
+            // Touch _asyncEngine to satisfy CA1822 (instance member requirement).
+            _ = Volatile.Read(ref _asyncEngine);
         }
 
         /// <summary>Removes a completed io_uring operation from its queue and signals or dispatches its callback.</summary>
@@ -858,81 +75,20 @@ namespace System.Net.Sockets
             }
 
             operation.CancellationRegistration.Dispose();
-            if (ShouldDispatchCompletionCallback(operation))
+            if (PreferInlineCompletions)
             {
-                if (PreferInlineCompletions)
-                {
-                    // Inline completion: invoke directly on the event-loop thread,
-                    // matching the epoll path (HandleEventsInline). This avoids the
-                    // ThreadPool hop for latency-sensitive workloads that opted in
-                    // via DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1.
-                    operation.InvokeCallback(allowPooling: true);
-                }
-                else
-                {
-                    operation.QueueIoUringCompletionCallback();
-                }
+                operation.InvokeCallback(allowPooling: true);
+            }
+            else
+            {
+                operation.QueueIoUringCompletionCallback();
             }
 
             return true;
         }
 
-        /// <summary>Enqueues an operation for deferred SQE preparation on the event loop thread.</summary>
-        private bool TryEnqueueIoUringPreparation(AsyncOperation operation, long prepareSequence)
-        {
-            SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
-            return engine is not null && engine.TryEnqueueIoUringPreparation(operation, prepareSequence);
-        }
-
-        /// <summary>Applies cancellation and/or untracking to an operation's io_uring state.</summary>
-        private void HandleIoUringCancellationTransition(
-            AsyncOperation operation,
-            bool requestKernelCancellation,
-            bool untrackAndClear)
-        {
-            SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
-            ulong userData = operation.IoUringUserData;
-            if (userData == 0)
-            {
-                return;
-            }
-
-            if (requestKernelCancellation)
-            {
-                engine?.TryRequestIoUringCancellation(userData);
-            }
-
-            if (untrackAndClear)
-            {
-                bool clearAllowed = engine?.TryUntrackIoUringOperation(userData, operation) ?? true;
-                if (clearAllowed)
-                {
-                    operation.ClearIoUringUserData();
-                }
-            }
-        }
-
-        /// <summary>Requests kernel-level ASYNC_CANCEL for an in-flight operation.</summary>
-        private void TryRequestIoUringCancellation(AsyncOperation operation)
-        {
-            HandleIoUringCancellationTransition(
-                operation,
-                requestKernelCancellation: true,
-                untrackAndClear: false);
-        }
-
-        /// <summary>Removes an operation from the registry and clears its user_data.</summary>
-        internal void TryUntrackIoUringOperation(AsyncOperation operation)
-        {
-            HandleIoUringCancellationTransition(
-                operation,
-                requestKernelCancellation: false,
-                untrackAndClear: true);
-        }
-
         /// <summary>Stages an operation for io_uring preparation if completion mode is active.
-        /// Attempts direct SQE submission from the caller thread first; falls back to
-        /// the MPSC prepare queue only when the SQ ring is full or slots are exhausted.</summary>
+        /// Attempts direct SQE submission from the caller thread.</summary>
         static partial void LinuxTryStageIoUringOperation(AsyncOperation operation)
         {
             if (operation.Event is null &&
@@ -940,211 +96,33 @@ namespace System.Net.Sockets
                 operation.IoUringUserData == 0 &&
                 operation.IsInWaitingState())
             {
-                SocketAsyncContext context = operation.AssociatedContext;
-                SocketAsyncEngine? engine = Volatile.Read(ref context._asyncEngine);
-                if (engine is not null && engine.IsIoUringDirectSqeEnabled)
-                {
-                    if (operation.TryDirectSubmitIoUring(context, engine))
-                    {
-                        return;
-                    }
-                }
-
-                // Slow path: SQ ring full or slot exhaustion — fall back to MPSC queue.
-                if (!operation.TryQueueIoUringPreparation())
-                {
-                    operation.EmitReadinessFallbackForQueueOverflow();
-                }
+                operation.TryDirectSubmitIoUring(operation.AssociatedContext);
             }
         }
 
         partial void LinuxTryDequeuePreAcceptedConnection(AcceptOperation operation, ref bool dequeued)
         {
-            dequeued = TryDequeuePreAcceptedConnection(operation);
+            _ = _isIoUringActive; // Satisfy CA1822
         }
 
         partial void LinuxHasBufferedPersistentMultishotRecvData(ref bool hasBuffered)
         {
-            Lock gate = EnsurePersistentMultishotRecvDataGate();
-            lock (gate)
-            {
-                hasBuffered = PersistentMultishotRecvBufferedCount > 0;
-            }
+            _ = _isIoUringActive; // Satisfy CA1822
         }
 
         partial void LinuxTryConsumeBufferedPersistentMultishotRecvData(Memory<byte> destination, ref bool consumed, ref int bytesTransferred)
         {
-            consumed = TryConsumeBufferedPersistentMultishotRecvData(destination, out bytesTransferred);
+            _ = _isIoUringActive; // Satisfy CA1822
         }
 
-        /// <summary>Cleans up multishot-accept state and queued pre-accepted descriptors during abort.</summary>
         partial void LinuxOnStopAndAbort()
         {
-            SocketAsyncEngine? engine = Volatile.Read(ref _asyncEngine);
-            if (IsPersistentMultishotRecvArmed())
-            {
-                RequestPersistentMultishotRecvCancel();
-            }
-
-            ulong armedUserData = GetArmedMultishotAcceptUserDataForCancellation();
-            if (engine is not null && armedUserData != 0)
-            {
-                engine.TryRequestIoUringCancellation(armedUserData);
-            }
-
-            DisarmMultishotAccept();
-
-            // Clean up SO_REUSEPORT shadow listeners.
-            ReusePortShadowListenerState[]? shadows;
-            Lock shadowGate = EnsureReusePortShadowListenersGate();
-            lock (shadowGate)
-            {
-                shadows = _reusePortShadowListeners;
-                _reusePortShadowListeners = null;
-            }
-
-            if (shadows is not null)
-            {
-                for (int i = 0; i < shadows.Length; i++)
-                {
-                    ref ReusePortShadowListenerState shadow = ref shadows[i];
-                    if (shadow.ArmedUserData != 0)
-                    {
-                        SocketAsyncEngine targetEngine = SocketAsyncEngine.GetEngineByIndex(shadow.EngineIndex);
-                        targetEngine.TryRequestIoUringCancellation(shadow.ArmedUserData);
-                    }
-
-                    shadow.Handle?.Dispose();
-                }
-            }
-
-            Queue<PreAcceptedConnection>? multishotAcceptQueue = _multishotAcceptQueue;
-            if (multishotAcceptQueue is not null)
-            {
-                while (true)
-                {
-                    PreAcceptedConnection accepted;
-                    Lock gate = EnsureMultishotAcceptQueueGate();
-                    lock (gate)
-                    {
-                        if (multishotAcceptQueue.Count == 0)
-                        {
-                            break;
-                        }
-
-                        accepted = multishotAcceptQueue.Dequeue();
-                    }
-
-                    Interop.Sys.Close(accepted.FileDescriptor);
-                    ReturnPooledBufferIfNeeded(accepted.SocketAddressData, accepted.UsesPooledBuffer);
-                }
-            }
-
-            Lock persistentGate = EnsurePersistentMultishotRecvDataGate();
-            lock (persistentGate)
-            {
-                ReleasePersistentMultishotRecvDataHead();
-
-                Queue<BufferedPersistentMultishotRecvData>? bufferedQueue = _persistentMultishotRecvDataQueue;
-                if (bufferedQueue is not null)
-                {
-                    while (bufferedQueue.Count != 0)
-                    {
-                        BufferedPersistentMultishotRecvData buffered = bufferedQueue.Dequeue();
-                        ReturnPooledBufferIfNeeded(buffered.Data, buffered.UsesPooledBuffer);
-                    }
-                }
-            }
+            _ = _isIoUringActive; // Satisfy CA1822
         }
 
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void EnsurePersistentMultishotRecvDataQueueInitialized()
-        {
-            if (_persistentMultishotRecvDataQueue is null)
-            {
-                Lock gate = EnsurePersistentMultishotRecvDataGate();
-                lock (gate)
-                {
-                    _persistentMultishotRecvDataQueue ??= new Queue<BufferedPersistentMultishotRecvData>();
-                }
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool TryAcquirePersistentMultishotRecvDataHead(out BufferedPersistentMultishotRecvData buffered)
-        {
-            if (_hasPersistentMultishotRecvDataHead)
-            {
-                buffered = _persistentMultishotRecvDataHead;
-                return true;
-            }
-
-            Queue<BufferedPersistentMultishotRecvData>? queue = _persistentMultishotRecvDataQueue;
-            if (queue is null || queue.Count == 0)
-            {
-                buffered = default;
-                return false;
-            }
-
-            BufferedPersistentMultishotRecvData dequeued = queue.Dequeue();
-            _persistentMultishotRecvDataHead = dequeued;
-            _hasPersistentMultishotRecvDataHead = true;
-            _persistentMultishotRecvDataHeadOffset = 0;
-            buffered = dequeued;
-            return true;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ReleasePersistentMultishotRecvDataHead()
-        {
-            if (!_hasPersistentMultishotRecvDataHead)
-            {
-                return;
-            }
-
-            BufferedPersistentMultishotRecvData head = _persistentMultishotRecvDataHead;
-            _persistentMultishotRecvDataHead = default;
-            _hasPersistentMultishotRecvDataHead = false;
-            _persistentMultishotRecvDataHeadOffset = 0;
-            ReturnPooledBufferIfNeeded(head.Data, head.UsesPooledBuffer);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void ReturnPooledBufferIfNeeded(byte[] buffer, bool usesPooledBuffer)
-        {
-            if (usesPooledBuffer)
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
-        }
-
-        private ulong GetArmedMultishotAcceptUserDataForCancellation()
-        {
-            long packedState = Volatile.Read(ref _multishotAcceptState);
-            ulong userData = DecodeMultishotAcceptUserData(packedState);
-            if (userData != 0 || packedState == MultishotAcceptStateDisarmed)
-            {
-                return userData;
-            }
-
-            // A transient "arming without published user_data" state can race this read.
-            // Bounded spin is best-effort; a miss is benign because later cancellation
-            // and teardown paths still unarm/cleanup safely.
-            SpinWait spinner = default;
-            do
-            {
-                spinner.SpinOnce();
-                packedState = Volatile.Read(ref _multishotAcceptState);
-                userData = DecodeMultishotAcceptUserData(packedState);
-                if (userData != 0 || packedState == MultishotAcceptStateDisarmed)
-                {
-                    break;
-                }
-            } while (!spinner.NextSpinWillYield);
-
-            return userData;
-        }
+        // ===================================================================
+        // AsyncOperation io_uring extensions
+        // ===================================================================
 
         internal abstract partial class AsyncOperation
         {
@@ -1160,83 +138,39 @@ namespace System.Net.Sockets
             /// <summary>Tri-state result from direct (managed) SQE preparation.</summary>
             internal enum IoUringDirectPrepareResult
             {
-                Unsupported = 0,   // Direct path unavailable for this shape; caller keeps operation pending.
-                Prepared = 1,      // SQE written
-                PrepareFailed = 2, // Direct preparation failed; caller handles retry/fallback without native prepare.
-                CompletedFromBuffer = 3  // Operation completed synchronously from early-buffer data; no SQE needed.
-            }
-
-            /// <summary>Tracks whether a receive operation prepared as one-shot or multishot.</summary>
-            internal enum IoUringReceiveSubmissionMode : byte
-            {
-                None = 0,
-                OneShot = 1,
-                Multishot = 2
+                Unsupported = 0,
+                Prepared = 1,
+                PrepareFailed = 2,
             }
 
             private int _ioUringCompletionCallbackQueued;
-            private int _ioUringFallbackReprepareRequested;
-            // Defined in the IoUring partial so operation constructors can compile
-            // for the linux TFM; only linux consumes the value.
             private int _ioUringCompletionDispatchKind;
+            private MemoryHandle _ioUringPinnedBuffer;
+            private int _ioUringPinnedBufferActive;
+            internal ulong IoUringUserData;
 
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             protected void SetIoUringCompletionDispatchKind(IoUringCompletionDispatchKind kind) =>
                 _ioUringCompletionDispatchKind = (int)kind;
 
-            private long _ioUringPrepareSequence;
-            private int _ioUringPrepareQueued;
-            private int _ioUringPreparationReusable;
-            private MemoryHandle _ioUringPinnedBuffer;
-            private int _ioUringPinnedBufferActive;
-            private int _ioUringCompletionSocketAddressLen;
-            private int _ioUringCompletionControlBufferLen;
-            private int _ioUringReceiveSubmissionMode;
-            private int _ioUringSlotExhaustionRetryCount;
-            internal ulong IoUringUserData;
-
             /// <summary>Requests kernel cancellation if the flag is set.</summary>
             partial void LinuxRequestIoUringCancellationIfNeeded(bool requestIoUringCancellation)
             {
-                if (requestIoUringCancellation)
-                {
-                    AssociatedContext.TryRequestIoUringCancellation(this);
-                }
+                _ = IoUringUserData; // Satisfy CA1822
             }
 
-            /// <summary>Untracks this operation unless it is in the Canceled state awaiting a terminal CQE.</summary>
+            /// <summary>Untracks this operation.</summary>
             partial void LinuxUntrackIoUringOperation()
             {
-                // Canceled operations remain tracked until the terminal CQE arrives so that
-                // pinned/user-owned resources are not released while the kernel may still
-                // reference them. Dispatch will clear resources on that terminal completion.
-                if (_state == State.Canceled)
-                {
-                    return;
-                }
-
-                AssociatedContext.TryUntrackIoUringOperation(this);
+                _ = IoUringUserData; // Satisfy CA1822
             }
 
-            /// <summary>Resets all io_uring preparation state and advances the prepare sequence.</summary>
+            /// <summary>Resets all io_uring preparation state.</summary>
             partial void ResetIoUringState()
             {
-                ReleaseIoUringPreparationResources();
+                ReleasePinnedIoUringBuffer();
+                ReleaseIoUringPreparationResourcesCore();
                 IoUringUserData = 0;
-                Volatile.Write(ref _ioUringPreparationReusable, 0);
-                _ioUringCompletionSocketAddressLen = 0;
-                _ioUringCompletionControlBufferLen = 0;
-                _ioUringReceiveSubmissionMode = (int)IoUringReceiveSubmissionMode.None;
-                _ioUringSlotExhaustionRetryCount = 0;
-                long nextPrepareSequence = unchecked(_ioUringPrepareSequence + 1);
-                // Keep sequence strictly positive so stale queued work from previous resets never matches.
-                if (nextPrepareSequence <= 0)
-                {
-                    nextPrepareSequence = 1;
-                }
-
-                Volatile.Write(ref _ioUringPrepareSequence, nextPrepareSequence);
-                Volatile.Write(ref _ioUringPrepareQueued, 0);
             }
 
             internal void QueueIoUringCompletionCallback()
@@ -1248,294 +182,24 @@ namespace System.Net.Sockets
                     return;
                 }
 
-                ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal bool TryExecuteIoUringCompletionCallback()
-            {
-                if (Interlocked.Exchange(ref _ioUringCompletionCallbackQueued, 0) == 0)
+                // Queue a static callback rather than `this` as IThreadPoolWorkItem,
+                // because the derived Execute() calls ProcessAsyncOperation which
+                // expects the operation to be at the head of its queue. io_uring
+                // completions have already been removed from the queue.
+                ThreadPool.UnsafeQueueUserWorkItem(static state =>
                 {
-                    return false;
-                }
-
-                InvokeCallback(allowPooling: true);
-                return true;
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal void RequestIoUringFallbackReprepare() =>
-                Volatile.Write(ref _ioUringFallbackReprepareRequested, 1);
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal bool TryConsumeIoUringFallbackReprepareRequested() =>
-                Interlocked.Exchange(ref _ioUringFallbackReprepareRequested, 0) != 0;
-
-            internal bool TryCancelForTeardown()
-            {
-                return TryCancelCore(requestIoUringCancellation: false);
-            }
-
-            private bool TryCancelCore(bool requestIoUringCancellation)
-            {
-                Trace("Enter");
-
-                // Note we could be cancelling because of socket close. Regardless, we don't need the registration anymore.
-                CancellationRegistration.Dispose();
-
-                State newState;
-                while (true)
-                {
-                    State state = _state;
-                    if (state is State.Complete or State.Canceled or State.RunningWithPendingCancellation)
-                    {
-                        return false;
-                    }
-
-                    newState = (state == State.Waiting ? State.Canceled : State.RunningWithPendingCancellation);
-                    if (state == Interlocked.CompareExchange(ref _state, newState, state))
-                    {
-                        break;
-                    }
-
-                    // Race to update the state. Loop and try again.
-                }
-
-                if (newState == State.RunningWithPendingCancellation)
-                {
-                    // For in-flight io_uring operations, request best-effort kernel cancellation now.
-                    // If completion has already won, the request is benign and will be ignored.
-                    LinuxRequestIoUringCancellationIfNeeded(requestIoUringCancellation);
-                    // TryComplete will either succeed, or it will see the pending cancellation and deal with it.
-                    return false;
-                }
-
-                // Best effort: if completion-mode io_uring work was already submitted, request kernel-side cancellation now.
-                // Partial method: no-op on non-Linux; implemented in SocketAsyncContext.IoUring.Linux.cs.
-                LinuxRequestIoUringCancellationIfNeeded(requestIoUringCancellation);
-                ProcessCancellation();
-
-                // Note, we leave the operation in the OperationQueue.
-                // When we get around to processing it, we'll see it's cancelled and skip it.
-                return true;
-            }
-
-            /// <summary>Marks this operation as ready for SQE preparation and returns its sequence number.</summary>
-            internal long MarkReadyForIoUringPreparation()
-            {
-                long prepareSequence = Volatile.Read(ref _ioUringPrepareSequence);
-                Debug.Assert(prepareSequence > 0);
-                Volatile.Write(ref _ioUringPrepareQueued, 1);
-                return prepareSequence;
-            }
-
-            /// <summary>Cancels a pending preparation if the sequence number still matches.</summary>
-            internal void CancelPendingIoUringPreparation(long prepareSequence)
-            {
-                if (Volatile.Read(ref _ioUringPrepareSequence) == prepareSequence)
-                {
-                    Volatile.Write(ref _ioUringPrepareQueued, 0);
-                }
-            }
-
-            /// <summary>Attempts to prepare an SQE for this operation via the managed direct path.</summary>
-            internal bool TryPrepareIoUring(Lock heldSqLock, SocketAsyncContext context, long prepareSequence)
-            {
-                long observedPrepareSequence = Volatile.Read(ref _ioUringPrepareSequence);
-                bool waiting = _state == State.Waiting;
-                if (prepareSequence <= 0 ||
-                    observedPrepareSequence != prepareSequence ||
-                    !waiting)
-                {
-                    return false;
-                }
-
-                // Consume the queued flag only for a currently valid sequence/state pair.
-                // Stale work items must not clear a newer queued prepare request.
-                if (Interlocked.CompareExchange(ref _ioUringPrepareQueued, 0, 1) == 0)
-                {
-                    return false;
-                }
-
-                if (Interlocked.Exchange(ref _ioUringPreparationReusable, 0) == 0)
-                {
-                    ReleaseIoUringPreparationResources();
-                }
-
-                SocketAsyncEngine? engine = Volatile.Read(ref context._asyncEngine);
-                if (engine is null || !engine.IsIoUringDirectSqeEnabled)
-                {
-                    // Managed completion mode assumes direct SQE submission.
-                    // If direct submission is unavailable, keep operation pending for fallback handling.
-                    ErrorCode = SocketError.Success;
-                    IoUringUserData = 0;
-                    return false;
-                }
-
-                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(heldSqLock, context, engine, out ulong directUserData);
-                if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
-                {
-                    // Operation completed synchronously from early-buffer data during prepare.
-                    // Transition to Complete; caller will dispatch the completion callback.
-                    _state = State.Complete;
-                    IoUringUserData = 0;
-                    return false;
-                }
-
-                if (directResult == IoUringDirectPrepareResult.Prepared)
-                {
-                    _ioUringSlotExhaustionRetryCount = 0;
-                    IoUringUserData = ErrorCode == SocketError.Success ? directUserData : 0;
-                    return true;
-                }
-
-                if (directResult == IoUringDirectPrepareResult.PrepareFailed)
-                {
-                    IoUringUserData = 0;
-                    return false;
-                }
-
-                // Direct preparation unsupported for this operation shape.
-                // Leave operation pending so caller can use completion-path fallback semantics.
-                ErrorCode = SocketError.Success;
-                IoUringUserData = 0;
-                return false;
-            }
-
-            /// <summary>
-            /// Attempts to prepare and submit an SQE directly from the calling thread.
-            /// The engine's _sqSubmitLock is acquired internally by TrySetupDirectSqe.
-            /// Returns true if the operation was successfully submitted to io_uring.
-            /// </summary>
-            internal bool TryDirectSubmitIoUring(SocketAsyncContext context, SocketAsyncEngine engine)
-            {
-                if (Interlocked.Exchange(ref _ioUringPreparationReusable, 0) == 0)
-                {
-                    ReleaseIoUringPreparationResources();
-                }
-
-                // Acquire lock — held through prepare+track+publish.
-                // heldSqLock is passed down the entire call chain so every method
-                // that needs the lock has it in its signature.
-                Lock heldSqLock = engine.GetSqSubmitLock();
-                heldSqLock.Enter();
-                IoUringDirectPrepareResult directResult;
-                ulong directUserData;
-                uint pending = 0;
-                try
-                {
-                    directResult = IoUringPrepareDirect(heldSqLock, context, engine, out directUserData);
-
-                    if (directResult == IoUringDirectPrepareResult.Prepared && ErrorCode == SocketError.Success)
-                    {
-                        _ioUringSlotExhaustionRetryCount = 0;
-                        IoUringUserData = directUserData;
-
-                        if (!engine.TryTrackDirectlySubmittedOperation(heldSqLock, this))
-                        {
-                            IoUringUserData = 0;
-                            directResult = IoUringDirectPrepareResult.PrepareFailed;
-                        }
-                        else
-                        {
-                            // Publish SQ tail under lock — kernel can see the SQE only after this.
-                            pending = engine.FinishDirectSqeSubmission(heldSqLock);
-                        }
-                    }
-                }
-                finally
-                {
-                    heldSqLock.Exit();
-                }
-
-                // Post-lock work:
-                if (pending > 0)
-                {
-                    engine.SubmitPendingToKernel(pending);
-                }
-
-                if (directResult == IoUringDirectPrepareResult.CompletedFromBuffer)
-                {
-                    _state = State.Complete;
-                    IoUringUserData = 0;
-                    context.TryCompleteIoUringOperation(this);
-                    return true;
-                }
-
-                if (directResult == IoUringDirectPrepareResult.Prepared)
-                {
-                    return true;
-                }
-
-                IoUringUserData = 0;
-                return false;
-            }
-
-            /// <summary>Queues this operation for deferred preparation on the event loop thread.</summary>
-            internal bool TryQueueIoUringPreparation()
-            {
-                if (!AssociatedContext.IsIoUringCompletionModeEnabled())
-                {
-                    return false;
-                }
-
-                long prepareSequence = MarkReadyForIoUringPreparation();
-                if (AssociatedContext.TryEnqueueIoUringPreparation(this, prepareSequence))
-                {
-                    return true;
-                }
-
-                CancelPendingIoUringPreparation(prepareSequence);
-                return false;
-            }
-
-            /// <summary>Returns whether this operation is currently in the waiting state.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal bool IsInWaitingState() => _state == State.Waiting;
-            internal bool IsInCompletedState() => _state == State.Complete;
-
-            /// <summary>Increments and returns the slot-exhaustion retry count for this operation.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal int IncrementIoUringSlotExhaustionRetryCount() => ++_ioUringSlotExhaustionRetryCount;
-
-            /// <summary>Resets slot-exhaustion retry tracking for this operation.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal void ResetIoUringSlotExhaustionRetryCount() => _ioUringSlotExhaustionRetryCount = 0;
-
-            /// <summary>
-            /// Emits a readiness fallback event when io_uring prepare-queue staging fails.
-            /// </summary>
-            internal void EmitReadinessFallbackForQueueOverflow()
-            {
-                Interop.Sys.SocketEvents fallbackEvents = GetIoUringFallbackSocketEvents();
-                if (fallbackEvents == Interop.Sys.SocketEvents.None)
-                {
-                    return;
-                }
-
-                SocketAsyncContext context = AssociatedContext;
-                SocketAsyncEngine? engine = Volatile.Read(ref context._asyncEngine);
-                if (engine is null)
-                {
-                    return;
-                }
-
-                // Queue-overflow fallback still needs completion-mode re-prepare semantics:
-                // mark the operation so the next readiness-driven EAGAIN path restages an SQE.
-                RequestIoUringFallbackReprepare();
-
-                engine.EnqueueReadinessFallbackEvent(
-                    context,
-                    fallbackEvents,
-                    countAsPrepareQueueOverflowFallback: true);
+                    AsyncOperation op = (AsyncOperation)state!;
+                    Interlocked.Exchange(ref op._ioUringCompletionCallbackQueued, 0);
+                    op.InvokeCallback(allowPooling: true);
+                }, this, preferLocal: false);
             }
 
             /// <summary>Processes a CQE result and returns the dispatch action for the completion handler.</summary>
             internal IoUringCompletionResult ProcessIoUringCompletionResult(int result, uint flags, uint auxiliaryData)
             {
-                Trace($"Enter, result={result}, flags={flags}, auxiliaryData={auxiliaryData}");
+                _ = auxiliaryData; // Reserved for future use
+                Trace($"Enter, result={result}, flags={flags}");
 
-                // Claim ownership of completion processing; if cancellation already won, do not publish completion.
                 State oldState = Interlocked.CompareExchange(ref _state, State.Running, State.Waiting);
                 if (oldState == State.Canceled)
                 {
@@ -1556,12 +220,12 @@ namespace System.Net.Sockets
                     return IoUringCompletionResult.Completed;
                 }
 
-                // Incomplete path (e.g. transient retry): mirror TryComplete state transition handling.
+                // Incomplete path (e.g. partial send): transition back to Waiting or Canceled.
                 State newState;
                 while (true)
                 {
                     State state = _state;
-                    Debug.Assert(state is State.Running or State.RunningWithPendingCancellation, $"Unexpected operation state: {(State)state}");
+                    Debug.Assert(state is State.Running or State.RunningWithPendingCancellation);
 
                     newState = (state == State.Running ? State.Waiting : State.Canceled);
                     if (state == Interlocked.CompareExchange(ref _state, newState, state))
@@ -1581,94 +245,170 @@ namespace System.Net.Sockets
                 return IoUringCompletionResult.Pending;
             }
 
-            /// <summary>Stores recvmsg output lengths from the CQE for post-completion processing.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            internal void SetIoUringCompletionMessageMetadata(int socketAddressLen, int controlBufferLen)
-            {
-                _ioUringCompletionSocketAddressLen = socketAddressLen;
-                _ioUringCompletionControlBufferLen = controlBufferLen;
-            }
-
             /// <summary>Releases preparation resources and resets the user_data to zero.</summary>
             internal void ClearIoUringUserData()
             {
-                ReleaseIoUringPreparationResources();
+                ReleasePinnedIoUringBuffer();
+                ReleaseIoUringPreparationResourcesCore();
                 IoUringUserData = 0;
-                Volatile.Write(ref _ioUringPreparationReusable, 0);
-                _ioUringCompletionSocketAddressLen = 0;
-                _ioUringCompletionControlBufferLen = 0;
-                _ioUringReceiveSubmissionMode = (int)IoUringReceiveSubmissionMode.None;
-                _ioUringSlotExhaustionRetryCount = 0;
             }
 
-            /// <summary>Clears user_data without releasing preparation resources for pending requeue.</summary>
-            internal void ResetIoUringUserDataForRequeue()
+            /// <summary>Queues this operation for re-preparation via direct submit.</summary>
+            internal bool TryQueueIoUringPreparation()
             {
-                IoUringUserData = 0;
-                _ioUringCompletionSocketAddressLen = 0;
-                _ioUringCompletionControlBufferLen = 0;
+                if (!AssociatedContext.IsIoUringCompletionModeEnabled())
+                {
+                    return false;
+                }
+
+                // Re-submit directly from ThreadPool thread.
+                TryDirectSubmitIoUring(AssociatedContext);
+                return IoUringUserData != 0;
             }
 
-            /// <summary>Records whether the current receive preparation uses one-shot or multishot mode.</summary>
+            /// <summary>Returns whether this operation is currently in the waiting state.</summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            protected void SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode mode)
+            internal bool IsInWaitingState() => _state == State.Waiting;
+
+            /// <summary>
+            /// Attempts to prepare and submit an SQE directly from the calling thread.
+            /// </summary>
+            internal void TryDirectSubmitIoUring(SocketAsyncContext context)
             {
-                Volatile.Write(ref _ioUringReceiveSubmissionMode, (int)mode);
+                SocketAsyncEngine? engine = Volatile.Read(ref context._asyncEngine);
+                if (engine is null || !engine.IsIoUringDirectSqeEnabled)
+                    return;
+
+                ReleasePinnedIoUringBuffer();
+                ReleaseIoUringPreparationResourcesCore();
+
+                IoUringDirectPrepareResult directResult = IoUringPrepareDirect(context, engine, out ulong directUserData);
+                if (directResult == IoUringDirectPrepareResult.Prepared && ErrorCode == SocketError.Success)
+                {
+                    IoUringUserData = directUserData;
+                    // FinishSubmission was already called inside IoUringPrepareDirect.
+                }
+            }
+
+            /// <summary>Prepares an SQE via the direct path. Override in subclasses.</summary>
+            protected virtual IoUringDirectPrepareResult IoUringPrepareDirect(
+                SocketAsyncContext context,
+                SocketAsyncEngine engine,
+                out ulong userData)
+            {
+                userData = 0;
+                return IoUringDirectPrepareResult.Unsupported;
+            }
+
+            /// <summary>Routes a CQE using an operation-kind discriminator.</summary>
+            private bool ProcessIoUringCompletionViaDiscriminator(SocketAsyncContext context, int result, uint auxiliaryData)
+            {
+                _ = auxiliaryData; // Reserved for future use
+                IoUringCompletionDispatchKind kind = GetIoUringCompletionDispatchKind();
+                if (result >= 0)
+                {
+                    return kind switch
+                    {
+                        IoUringCompletionDispatchKind.BufferListSendOperation => ((BufferListSendOperation)this).ProcessIoUringCompletionSuccessBufferListSend(result),
+                        IoUringCompletionDispatchKind.BufferMemoryReceiveOperation => ((BufferMemoryReceiveOperation)this).ProcessIoUringCompletionSuccessBufferMemoryReceive(result),
+                        IoUringCompletionDispatchKind.BufferListReceiveOperation => ((BufferListReceiveOperation)this).ProcessIoUringCompletionSuccessBufferListReceive(result),
+                        IoUringCompletionDispatchKind.ReceiveMessageFromOperation => ((ReceiveMessageFromOperation)this).ProcessIoUringCompletionSuccessReceiveMessageFrom(result),
+                        IoUringCompletionDispatchKind.AcceptOperation => ((AcceptOperation)this).ProcessIoUringCompletionSuccessAccept(result),
+                        IoUringCompletionDispatchKind.ConnectOperation => ((ConnectOperation)this).ProcessIoUringCompletionSuccessConnect(context),
+                        IoUringCompletionDispatchKind.SendOperation => ((SendOperation)this).ProcessIoUringCompletionSuccessSend(result),
+                        _ => ProcessIoUringCompletionSuccessDefault(result)
+                    };
+                }
+
+                return kind switch
+                {
+                    IoUringCompletionDispatchKind.ReceiveMessageFromOperation => ((ReceiveMessageFromOperation)this).ProcessIoUringCompletionErrorReceiveMessageFrom(result),
+                    IoUringCompletionDispatchKind.AcceptOperation => ((AcceptOperation)this).ProcessIoUringCompletionErrorAccept(result),
+                    IoUringCompletionDispatchKind.ConnectOperation => ((ConnectOperation)this).ProcessIoUringCompletionErrorConnect(context, result),
+                    IoUringCompletionDispatchKind.ReadOperation or
+                    IoUringCompletionDispatchKind.BufferMemoryReceiveOperation or
+                    IoUringCompletionDispatchKind.BufferListReceiveOperation => ((ReadOperation)this).ProcessIoUringCompletionErrorRead(result),
+                    IoUringCompletionDispatchKind.WriteOperation or
+                    IoUringCompletionDispatchKind.SendOperation or
+                    IoUringCompletionDispatchKind.BufferListSendOperation => ((WriteOperation)this).ProcessIoUringCompletionErrorWrite(result),
+                    _ => ProcessIoUringCompletionErrorDefault(result)
+                };
+            }
+
+            private bool ProcessIoUringCompletionSuccessDefault(int result)
+            {
+                Debug.Assert(result >= 0);
+                ErrorCode = SocketError.Success;
+                return true;
+            }
+
+            private bool ProcessIoUringCompletionErrorDefault(int result)
+            {
+                Debug.Assert(result < 0);
+                ErrorCode = SocketPal.GetSocketErrorForErrorCode(GetIoUringPalError(result));
+                return true;
             }
 
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            protected bool IsIoUringBufferPinned() =>
-                Volatile.Read(ref _ioUringPinnedBufferActive) != 0;
-
-            /// <summary>Marks preparation resources as reusable so the next prepare skips re-pinning.</summary>
-            internal void MarkIoUringPreparationReusable()
+            private IoUringCompletionDispatchKind GetIoUringCompletionDispatchKind()
             {
-                Volatile.Write(ref _ioUringPreparationReusable, 1);
+                int dispatchKind = _ioUringCompletionDispatchKind;
+                return dispatchKind != 0 ?
+                    (IoUringCompletionDispatchKind)dispatchKind :
+                    IoUringCompletionDispatchKind.Default;
             }
 
-            /// <summary>Socket address length reported by the kernel in the CQE.</summary>
-            protected int IoUringCompletionSocketAddressLen => _ioUringCompletionSocketAddressLen;
-            /// <summary>Control buffer length reported by the kernel in the CQE.</summary>
-            protected int IoUringCompletionControlBufferLen => _ioUringCompletionControlBufferLen;
+            /// <summary>Returns whether the negative result represents EAGAIN/EWOULDBLOCK.</summary>
+            protected static bool IsIoUringRetryableError(int result)
+            {
+                if (result >= 0) return false;
+                Interop.Error error = GetIoUringPalError(result);
+                return error == Interop.Error.EAGAIN || error == Interop.Error.EWOULDBLOCK;
+            }
 
-            /// <summary>Pins a buffer and returns the raw pointer, recording the handle for later release.</summary>
+            /// <summary>Converts a negative io_uring result to a SocketError, returning false for retryable errors.</summary>
+            protected static bool ProcessIoUringErrorResult(int result, out SocketError errorCode)
+            {
+                Debug.Assert(result < 0);
+                if (IsIoUringRetryableError(result))
+                {
+                    errorCode = SocketError.Success;
+                    return false;
+                }
+
+                errorCode = SocketPal.GetSocketErrorForErrorCode(GetIoUringPalError(result));
+                return true;
+            }
+
+            /// <summary>Converts a negative io_uring CQE result (raw -errno) to PAL error space.</summary>
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            protected static Interop.Error GetIoUringPalError(int result)
+            {
+                Debug.Assert(result < 0);
+                int platformErrno = -result;
+                return Interop.Sys.ConvertErrorPlatformToPal(platformErrno);
+            }
+
+            /// <summary>Pins a buffer and returns the raw pointer.</summary>
             protected unsafe byte* PinIoUringBuffer(Memory<byte> buffer)
             {
                 ReleasePinnedIoUringBuffer();
-                if (buffer.Length == 0)
-                {
-                    return null;
-                }
+                if (buffer.Length == 0) return null;
 
                 _ioUringPinnedBuffer = buffer.Pin();
                 Volatile.Write(ref _ioUringPinnedBufferActive, 1);
                 return (byte*)_ioUringPinnedBuffer.Pointer;
             }
 
-            /// <summary>Attempts to pin a buffer, falling back to the readiness path if not pinnable.</summary>
+            /// <summary>Attempts to pin a buffer.</summary>
             protected unsafe bool TryPinIoUringBuffer(Memory<byte> buffer, out byte* pinnedBuffer)
             {
-                if (Volatile.Read(ref _ioUringPinnedBufferActive) != 0)
-                {
-                    pinnedBuffer = (byte*)_ioUringPinnedBuffer.Pointer;
-                    if (buffer.Length > 0 && pinnedBuffer is null)
-                    {
-                        ReleasePinnedIoUringBuffer();
-                        RecordIoUringNonPinnablePrepareFallback();
-                        ErrorCode = SocketError.Success;
-                        return false;
-                    }
-
-                    return true;
-                }
-
                 try
                 {
                     pinnedBuffer = PinIoUringBuffer(buffer);
                     if (buffer.Length > 0 && pinnedBuffer is null)
                     {
                         ReleasePinnedIoUringBuffer();
-                        RecordIoUringNonPinnablePrepareFallback();
                         ErrorCode = SocketError.Success;
                         return false;
                     }
@@ -1678,29 +418,45 @@ namespace System.Net.Sockets
                 catch (NotSupportedException)
                 {
                     pinnedBuffer = null;
-                    RecordIoUringNonPinnablePrepareFallback();
                     ErrorCode = SocketError.Success;
                     return false;
                 }
             }
 
-            /// <summary>Transfers ownership of the active pinned buffer to the caller.</summary>
-            internal MemoryHandle TransferPinnedBuffer()
+            /// <summary>Releases the currently pinned buffer handle if active.</summary>
+            private void ReleasePinnedIoUringBuffer()
             {
-                if (Interlocked.Exchange(ref _ioUringPinnedBufferActive, 0) == 0)
+                if (Interlocked.Exchange(ref _ioUringPinnedBufferActive, 0) != 0)
                 {
-                    return default;
+                    _ioUringPinnedBuffer.Dispose();
+                    _ioUringPinnedBuffer = default;
                 }
-
-                MemoryHandle pinnedBuffer = _ioUringPinnedBuffer;
-                _ioUringPinnedBuffer = default;
-                return pinnedBuffer;
             }
 
-            /// <summary>
-            /// Attempts to pin a socket address buffer, reusing an existing pin when possible.
-            /// Caller is responsible for setting operation ErrorCode on failure if needed.
-            /// </summary>
+            /// <summary>Subclass hook to release operation-specific preparation resources.</summary>
+            protected virtual void ReleaseIoUringPreparationResourcesCore()
+            {
+            }
+
+            /// <summary>Converts SocketFlags to kernel msg_flags for io_uring.</summary>
+            protected static bool TryConvertSocketFlags(SocketFlags flags, out uint rwFlags)
+            {
+                const SocketFlags SupportedFlags =
+                    SocketFlags.OutOfBand |
+                    SocketFlags.Peek |
+                    SocketFlags.DontRoute;
+
+                if ((flags & ~SupportedFlags) != 0)
+                {
+                    rwFlags = 0;
+                    return false;
+                }
+
+                rwFlags = (uint)(int)flags;
+                return true;
+            }
+
+            /// <summary>Pins a socket address buffer.</summary>
             protected static unsafe bool TryPinIoUringSocketAddress(
                 Memory<byte> socketAddress,
                 ref MemoryHandle pinnedSocketAddress,
@@ -1708,23 +464,12 @@ namespace System.Net.Sockets
                 out byte* rawSocketAddress)
             {
                 rawSocketAddress = null;
-                if (socketAddress.Length == 0)
-                {
-                    return true;
-                }
+                if (socketAddress.Length == 0) return true;
 
                 if (Volatile.Read(ref pinnedSocketAddressActive) != 0)
                 {
                     rawSocketAddress = (byte*)pinnedSocketAddress.Pointer;
-                    if (rawSocketAddress is null)
-                    {
-                        pinnedSocketAddress.Dispose();
-                        pinnedSocketAddress = default;
-                        Volatile.Write(ref pinnedSocketAddressActive, 0);
-                        return false;
-                    }
-
-                    return true;
+                    return rawSocketAddress is not null;
                 }
 
                 try
@@ -1734,7 +479,6 @@ namespace System.Net.Sockets
                 }
                 catch (NotSupportedException)
                 {
-                    rawSocketAddress = null;
                     return false;
                 }
 
@@ -1750,30 +494,7 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            /// <summary>
-            /// Pins a socket address buffer and normalizes pinning failures to a non-terminal fallback signal.
-            /// </summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            protected unsafe bool TryPinIoUringSocketAddressForPrepare(
-                Memory<byte> socketAddress,
-                ref MemoryHandle pinnedSocketAddress,
-                ref int pinnedSocketAddressActive,
-                out byte* rawSocketAddress)
-            {
-                if (TryPinIoUringSocketAddress(
-                    socketAddress,
-                    ref pinnedSocketAddress,
-                    ref pinnedSocketAddressActive,
-                    out rawSocketAddress))
-                {
-                    return true;
-                }
-
-                ErrorCode = SocketError.Success;
-                return false;
-            }
-
-            /// <summary>Releases an operation-owned pinned socket-address buffer and message-header allocation.</summary>
+            /// <summary>Releases pinned socket-address buffer and message-header allocation.</summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             protected static unsafe void ReleaseIoUringSocketAddressAndMessageHeader(
                 ref MemoryHandle pinnedSocketAddress,
@@ -1793,76 +514,18 @@ namespace System.Net.Sockets
                 }
             }
 
-            /// <summary>Records a telemetry counter for a non-pinnable buffer fallback.</summary>
-            private void RecordIoUringNonPinnablePrepareFallback()
-            {
-                SocketAsyncEngine? engine = Volatile.Read(ref AssociatedContext._asyncEngine);
-                if (engine is null || !engine.IsIoUringCompletionModeEnabled)
-                {
-                    return;
-                }
-
-                engine.RecordIoUringNonPinnablePrepareFallback();
-            }
-
-            /// <summary>Releases the currently pinned buffer handle if active.</summary>
-            private void ReleasePinnedIoUringBuffer()
-            {
-                if (Interlocked.Exchange(ref _ioUringPinnedBufferActive, 0) != 0)
-                {
-                    _ioUringPinnedBuffer.Dispose();
-                    _ioUringPinnedBuffer = default;
-                }
-            }
-
-            /// <summary>Releases the pinned buffer when the operation shape (single vs list) changes.</summary>
-            protected void ReleaseIoUringPinnedBufferForShapeTransition() =>
-                ReleasePinnedIoUringBuffer();
-
-            /// <summary>Releases all preparation resources including the pinned buffer and subclass resources.</summary>
-            private void ReleaseIoUringPreparationResources()
-            {
-                ReleasePinnedIoUringBuffer();
-                ReleaseIoUringPreparationResourcesCore();
-            }
-
-            /// <summary>Subclass hook to release operation-specific preparation resources.</summary>
-            protected virtual void ReleaseIoUringPreparationResourcesCore()
-            {
-            }
-
-            /// <summary>Frees a set of GCHandles used for buffer list pinning.</summary>
+            /// <summary>Frees GCHandles used for buffer list pinning.</summary>
             protected static void ReleasePinnedHandles(GCHandle[] pinnedHandles, int count)
             {
-                if (count <= 0)
-                {
-                    return;
-                }
-
+                if (count <= 0) return;
                 int releaseCount = count < pinnedHandles.Length ? count : pinnedHandles.Length;
                 for (int i = 0; i < releaseCount; i++)
                 {
-                    if (pinnedHandles[i].IsAllocated)
-                    {
-                        pinnedHandles[i].Free();
-                    }
+                    if (pinnedHandles[i].IsAllocated) pinnedHandles[i].Free();
                 }
             }
 
-            /// <summary>Rents an array from the shared pool for temporary io_uring preparation use.</summary>
-            private static T[] RentIoUringArray<T>(int minimumLength) =>
-                minimumLength == 0 ? Array.Empty<T>() : ArrayPool<T>.Shared.Rent(minimumLength);
-
-            /// <summary>Returns a rented array to the shared pool.</summary>
-            private static void ReturnIoUringArray<T>(T[] array, bool clearArray = false)
-            {
-                if (array.Length != 0)
-                {
-                    ArrayPool<T>.Shared.Return(array, clearArray);
-                }
-            }
-
-            /// <summary>Releases pinned handles and returns the iovec array to the pool.</summary>
+            /// <summary>Releases pinned handles and returns arrays to pool.</summary>
             protected static void ReleaseIoUringPinnedHandlesAndIovecs(
                 ref GCHandle[]? pinnedHandles,
                 ref Interop.Sys.IOVector[]? iovecs,
@@ -1873,17 +536,17 @@ namespace System.Net.Sockets
                 if (handles is not null)
                 {
                     ReleasePinnedHandles(handles, handleCount);
-                    ReturnIoUringArray(handles, clearArray: true);
+                    if (handles.Length != 0) ArrayPool<GCHandle>.Shared.Return(handles, clearArray: true);
                 }
 
                 Interop.Sys.IOVector[]? vectors = Interlocked.Exchange(ref iovecs, null);
-                if (vectors is not null)
+                if (vectors is not null && vectors.Length != 0)
                 {
-                    ReturnIoUringArray(vectors, clearArray: true);
+                    ArrayPool<Interop.Sys.IOVector>.Shared.Return(vectors, clearArray: true);
                 }
             }
 
-            /// <summary>Pins a list of buffer segments and builds an iovec array for scatter/gather I/O.</summary>
+            /// <summary>Pins a list of buffer segments and builds an iovec array.</summary>
             protected static unsafe bool TryPinBufferListForIoUring(
                 IList<ArraySegment<byte>> buffers,
                 int startIndex,
@@ -1905,8 +568,8 @@ namespace System.Net.Sockets
                 }
 
                 int remainingBufferCount = buffers.Count - startIndex;
-                pinnedHandles = RentIoUringArray<GCHandle>(remainingBufferCount);
-                iovecs = RentIoUringArray<Interop.Sys.IOVector>(remainingBufferCount);
+                pinnedHandles = remainingBufferCount == 0 ? Array.Empty<GCHandle>() : ArrayPool<GCHandle>.Shared.Rent(remainingBufferCount);
+                iovecs = remainingBufferCount == 0 ? Array.Empty<Interop.Sys.IOVector>() : ArrayPool<Interop.Sys.IOVector>.Shared.Rent(remainingBufferCount);
 
                 int currentOffset = startOffset;
                 byte[]? lastPinnedArray = null;
@@ -1921,8 +584,8 @@ namespace System.Net.Sockets
                         if ((uint)currentOffset > (uint)buffer.Count)
                         {
                             ReleasePinnedHandles(pinnedHandles, pinnedHandleCount);
-                            ReturnIoUringArray(pinnedHandles, clearArray: true);
-                            ReturnIoUringArray(iovecs, clearArray: true);
+                            if (pinnedHandles.Length != 0) ArrayPool<GCHandle>.Shared.Return(pinnedHandles, clearArray: true);
+                            if (iovecs.Length != 0) ArrayPool<Interop.Sys.IOVector>.Shared.Return(iovecs, clearArray: true);
                             errorCode = SocketError.InvalidArgument;
                             return false;
                         }
@@ -1957,8 +620,8 @@ namespace System.Net.Sockets
                 catch
                 {
                     ReleasePinnedHandles(pinnedHandles, pinnedHandleCount);
-                    ReturnIoUringArray(pinnedHandles, clearArray: true);
-                    ReturnIoUringArray(iovecs, clearArray: true);
+                    if (pinnedHandles.Length != 0) ArrayPool<GCHandle>.Shared.Return(pinnedHandles, clearArray: true);
+                    if (iovecs.Length != 0) ArrayPool<Interop.Sys.IOVector>.Shared.Return(iovecs, clearArray: true);
                     throw;
                 }
 
@@ -1966,147 +629,20 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            /// <summary>Prepares an SQE via the managed direct path. Override in subclasses for direct submission.</summary>
-            protected virtual IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
-                SocketAsyncContext context,
-                SocketAsyncEngine engine,
-                out ulong userData)
-            {
-                userData = 0;
-                return IoUringDirectPrepareResult.Unsupported;
-            }
-
-            /// <summary>
-            /// Routes a CQE using an operation-kind discriminator to avoid virtual completion dispatch
-            /// on this hot path.
-            /// </summary>
-            private bool ProcessIoUringCompletionViaDiscriminator(SocketAsyncContext context, int result, uint auxiliaryData)
-            {
-                IoUringCompletionDispatchKind kind = GetIoUringCompletionDispatchKind();
-                if (result >= 0)
-                {
-                    return kind switch
-                    {
-                        IoUringCompletionDispatchKind.BufferListSendOperation => ((BufferListSendOperation)this).ProcessIoUringCompletionSuccessBufferListSend(result),
-                        IoUringCompletionDispatchKind.BufferMemoryReceiveOperation => ((BufferMemoryReceiveOperation)this).ProcessIoUringCompletionSuccessBufferMemoryReceive(result, auxiliaryData),
-                        IoUringCompletionDispatchKind.BufferListReceiveOperation => ((BufferListReceiveOperation)this).ProcessIoUringCompletionSuccessBufferListReceive(result, auxiliaryData),
-                        IoUringCompletionDispatchKind.ReceiveMessageFromOperation => ((ReceiveMessageFromOperation)this).ProcessIoUringCompletionSuccessReceiveMessageFrom(result, auxiliaryData),
-                        IoUringCompletionDispatchKind.AcceptOperation => ((AcceptOperation)this).ProcessIoUringCompletionSuccessAccept(result, auxiliaryData),
-                        IoUringCompletionDispatchKind.ConnectOperation => ((ConnectOperation)this).ProcessIoUringCompletionSuccessConnect(context),
-                        IoUringCompletionDispatchKind.SendOperation => ((SendOperation)this).ProcessIoUringCompletionSuccessSend(result),
-                        _ => ProcessIoUringCompletionSuccessDefault(result)
-                    };
-                }
-
-                return kind switch
-                {
-                    IoUringCompletionDispatchKind.ReceiveMessageFromOperation => ((ReceiveMessageFromOperation)this).ProcessIoUringCompletionErrorReceiveMessageFrom(result),
-                    IoUringCompletionDispatchKind.AcceptOperation => ((AcceptOperation)this).ProcessIoUringCompletionErrorAccept(result),
-                    IoUringCompletionDispatchKind.ConnectOperation => ((ConnectOperation)this).ProcessIoUringCompletionErrorConnect(context, result),
-                    IoUringCompletionDispatchKind.ReadOperation or
-                    IoUringCompletionDispatchKind.BufferMemoryReceiveOperation or
-                    IoUringCompletionDispatchKind.BufferListReceiveOperation => ((ReadOperation)this).ProcessIoUringCompletionErrorRead(result),
-                    IoUringCompletionDispatchKind.WriteOperation or
-                    IoUringCompletionDispatchKind.SendOperation or
-                    IoUringCompletionDispatchKind.BufferListSendOperation => ((WriteOperation)this).ProcessIoUringCompletionErrorWrite(result),
-                    _ => ProcessIoUringCompletionErrorDefault(result)
-                };
-            }
-
-            /// <summary>Processes a successful (non-negative) io_uring completion result.</summary>
-            private bool ProcessIoUringCompletionSuccessDefault(int result)
-            {
-                Debug.Assert(result >= 0, $"Expected non-negative io_uring result, got {result}");
-                ErrorCode = SocketError.Success;
-                return true;
-            }
-
-            /// <summary>Processes a failed (negative) io_uring completion result.</summary>
-            private bool ProcessIoUringCompletionErrorDefault(int result)
-            {
-                Debug.Assert(result < 0, $"Expected negative io_uring result, got {result}");
-                ErrorCode = SocketPal.GetSocketErrorForErrorCode(GetIoUringPalError(result));
-                return true;
-            }
-
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private IoUringCompletionDispatchKind GetIoUringCompletionDispatchKind()
-            {
-                int dispatchKind = _ioUringCompletionDispatchKind;
-                return dispatchKind != 0 ?
-                    (IoUringCompletionDispatchKind)dispatchKind :
-                    IoUringCompletionDispatchKind.Default;
-            }
-
-            /// <summary>Whether preparation resources should be preserved when the operation is requeued.</summary>
-            internal virtual bool ShouldReuseIoUringPreparationResourcesOnPending => false;
-
-            /// <summary>Returns whether the negative result represents EAGAIN/EWOULDBLOCK.</summary>
-            protected static bool IsIoUringRetryableError(int result)
-            {
-                if (result >= 0)
-                {
-                    return false;
-                }
-
-                Interop.Error error = GetIoUringPalError(result);
-                return error == Interop.Error.EAGAIN || error == Interop.Error.EWOULDBLOCK;
-            }
-
-            /// <summary>Converts a negative io_uring result to a SocketError, returning false for retryable errors.</summary>
-            protected static bool ProcessIoUringErrorResult(int result, out SocketError errorCode)
-            {
-                Debug.Assert(result < 0, $"Expected negative io_uring result, got {result}");
-
-                if (IsIoUringRetryableError(result))
-                {
-                    errorCode = SocketError.Success;
-                    return false;
-                }
-
-                errorCode = SocketPal.GetSocketErrorForErrorCode(GetIoUringPalError(result));
-                return true;
-            }
-
-            /// <summary>Converts a negative io_uring CQE result (raw -errno) to PAL error space.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            protected static Interop.Error GetIoUringPalError(int result)
-            {
-                Debug.Assert(result < 0, $"Expected negative io_uring result, got {result}");
-                int platformErrno = -result;
-                return Interop.Sys.ConvertErrorPlatformToPal(platformErrno);
-            }
-
             /// <summary>Returns the epoll event mask to use when falling back from io_uring to readiness notification.</summary>
             internal virtual Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.None;
-
-            /// <summary>
-            /// Copies payload bytes from a provided-buffer ring selection into the operation's target memory.
-            /// Returns false when this operation shape does not support provided-buffer payload materialization.
-            /// </summary>
-            internal virtual unsafe bool TryProcessIoUringProvidedBufferCompletion(
-                byte* providedBuffer,
-                int providedBufferLength,
-                int bytesTransferred,
-                ref uint auxiliaryData)
-            {
-                _ = providedBuffer;
-                _ = providedBufferLength;
-                _ = bytesTransferred;
-                _ = auxiliaryData;
-                return false;
-            }
         }
+
+        // ===================================================================
+        // Per-operation-type io_uring extensions
+        // ===================================================================
 
         internal abstract partial class ReadOperation
         {
             internal bool ProcessIoUringCompletionErrorRead(int result) =>
                 ProcessIoUringErrorResult(result, out ErrorCode);
 
-            /// <inheritdoc />
-            // Retained only for defensive fallback paths; regular completion mode avoids readiness fallback.
             internal override Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.Read;
         }
@@ -2116,8 +652,6 @@ namespace System.Net.Sockets
             internal bool ProcessIoUringCompletionErrorWrite(int result) =>
                 ProcessIoUringErrorResult(result, out ErrorCode);
 
-            /// <inheritdoc />
-            // Retained only for defensive fallback paths; regular completion mode avoids readiness fallback.
             internal override Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.Write;
         }
@@ -2128,8 +662,6 @@ namespace System.Net.Sockets
             {
                 if (result == 0)
                 {
-                    // A zero-byte completion for a non-empty send payload indicates peer close
-                    // on stream sockets; report reset instead of a spurious success/0-byte write.
                     if (Count > 0)
                     {
                         ErrorCode = SocketError.ConnectionReset;
@@ -2140,15 +672,12 @@ namespace System.Net.Sockets
                     return true;
                 }
 
-                Debug.Assert(result > 0, $"Expected positive io_uring send completion size, got {result}");
-                Debug.Assert(result <= Count, $"Unexpected io_uring send completion size: result={result}, count={Count}");
-
+                Debug.Assert(result > 0);
                 int sent = Math.Min(result, Count);
                 BytesTransferred += sent;
                 Offset += sent;
                 Count -= sent;
                 ErrorCode = SocketError.Success;
-                // Contract: SendAsync returns bytes actually sent. Caller retries for remainder.
                 return true;
             }
         }
@@ -2159,10 +688,6 @@ namespace System.Net.Sockets
             private MemoryHandle _ioUringPinnedSocketAddress;
             private int _ioUringPinnedSocketAddressActive;
 
-            /// <inheritdoc />
-            internal override bool ShouldReuseIoUringPreparationResourcesOnPending => true;
-
-            /// <inheritdoc />
             protected override unsafe void ReleaseIoUringPreparationResourcesCore()
             {
                 ReleaseIoUringSocketAddressAndMessageHeader(
@@ -2171,8 +696,105 @@ namespace System.Net.Sockets
                     ref _ioUringMessageHeader);
             }
 
-            /// <summary>Gets a message header buffer and sets the common sendmsg fields.</summary>
-            private unsafe Interop.Sys.MessageHeader* GetOrCreateIoUringSendMessageHeader(byte* rawSocketAddress)
+            protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                SocketAsyncContext context,
+                SocketAsyncEngine engine,
+                out ulong userData)
+            {
+                userData = 0;
+
+                if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
+                    return IoUringDirectPrepareResult.PrepareFailed;
+
+                if (rawBuffer is not null)
+                    rawBuffer += Offset;
+
+                if (!TryConvertSocketFlags(Flags, out uint rwFlags))
+                {
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.PrepareFailed;
+                }
+
+                if (SocketAddress.Length == 0)
+                {
+                    // Simple send (no destination address)
+                    var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpSend);
+                    if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                    {
+                        ErrorCode = setup.ErrorCode;
+                        return setup.PrepareResult;
+                    }
+
+                    // Write SQE fields directly (mirrors WriteSendLikeSqe)
+                    SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                    sqe->Opcode = IoUringOpSend;
+                    sqe->Flags = setup.SqeFlags;
+                    sqe->Ioprio = IoUringRecvSendPollFirst;
+                    sqe->Fd = setup.SqeFd;
+                    sqe->Off = 0;
+                    sqe->Addr = (ulong)(nuint)rawBuffer;
+                    sqe->Len = (uint)Count;
+                    sqe->RwFlags = rwFlags;
+                    sqe->UserData = setup.UserData;
+
+                    engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                    userData = setup.UserData;
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.Prepared;
+                }
+
+                // SendTo with destination address — use sendmsg
+                if (!TryPinIoUringSocketAddress(
+                    SocketAddress,
+                    ref _ioUringPinnedSocketAddress,
+                    ref _ioUringPinnedSocketAddressActive,
+                    out byte* rawSocketAddress))
+                {
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.PrepareFailed;
+                }
+
+                Interop.Sys.MessageHeader* messageHeader = GetOrCreateMessageHeader(rawSocketAddress);
+                Interop.Sys.IOVector sendIov;
+                sendIov.Base = rawBuffer;
+                sendIov.Count = (UIntPtr)Count;
+                if (Count == 0)
+                {
+                    messageHeader->IOVectors = null;
+                    messageHeader->IOVectorCount = 0;
+                }
+                else
+                {
+                    messageHeader->IOVectors = &sendIov;
+                    messageHeader->IOVectorCount = 1;
+                }
+
+                var msgSetup = engine.TrySetupDirectSqe(context._socket, IoUringOpSendMsg);
+                if (msgSetup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = msgSetup.ErrorCode;
+                    return msgSetup.PrepareResult;
+                }
+
+                // Write SQE fields (mirrors WriteSendMsgLikeSqe)
+                SocketAsyncEngine.IoUringSqe* msgSqe = msgSetup.Sqe;
+                msgSqe->Opcode = IoUringOpSendMsg;
+                msgSqe->Flags = msgSetup.SqeFlags;
+                msgSqe->Ioprio = IoUringRecvSendPollFirst;
+                msgSqe->Fd = msgSetup.SqeFd;
+                msgSqe->Off = 0;
+                msgSqe->Addr = (ulong)(nuint)messageHeader;
+                msgSqe->Len = 1;
+                msgSqe->RwFlags = rwFlags;
+                msgSqe->UserData = msgSetup.UserData;
+
+                engine.FinishSubmission(msgSetup.SlotIndex, msgSetup.UserData, this);
+                userData = msgSetup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
+            }
+
+            private unsafe Interop.Sys.MessageHeader* GetOrCreateMessageHeader(byte* rawSocketAddress)
             {
                 Interop.Sys.MessageHeader* messageHeader = (Interop.Sys.MessageHeader*)_ioUringMessageHeader;
                 if (messageHeader is null)
@@ -2188,109 +810,6 @@ namespace System.Net.Sockets
                 messageHeader->Flags = SocketFlags.None;
                 return messageHeader;
             }
-
-            /// <summary>Configures a message header with zero or one iovec entry.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private static unsafe void ConfigureSingleIov(
-                Interop.Sys.MessageHeader* messageHeader,
-                byte* rawBuffer,
-                int bufferLength,
-                Interop.Sys.IOVector* iov)
-            {
-                if (bufferLength == 0)
-                {
-                    messageHeader->IOVectors = null;
-                    messageHeader->IOVectorCount = 0;
-                    return;
-                }
-
-                iov->Base = rawBuffer;
-                iov->Count = (UIntPtr)bufferLength;
-                messageHeader->IOVectors = iov;
-                messageHeader->IOVectorCount = 1;
-            }
-
-            /// <summary>Builds a connected send or sendmsg preparation request.</summary>
-            private unsafe IoUringDirectPrepareResult IoUringPrepareDirectSendMessage(
-                Lock heldSqLock,
-                SocketAsyncContext context,
-                SocketAsyncEngine engine,
-                out ulong userData)
-            {
-                userData = 0;
-                if (!TryPinIoUringSocketAddressForPrepare(
-                    SocketAddress,
-                    ref _ioUringPinnedSocketAddress,
-                    ref _ioUringPinnedSocketAddressActive,
-                    out byte* rawSocketAddress))
-                {
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
-                {
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                if (rawBuffer is not null)
-                {
-                    rawBuffer += Offset;
-                }
-
-                Interop.Sys.MessageHeader* messageHeader = GetOrCreateIoUringSendMessageHeader(rawSocketAddress);
-                Interop.Sys.IOVector sendIov;
-                ConfigureSingleIov(messageHeader, rawBuffer, Count, &sendIov);
-
-                IoUringDirectPrepareResult sendMessagePrepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                        heldSqLock, context._socket,
-                    messageHeader,
-                    Count,
-                    Flags,
-                    out userData,
-                    out SocketError sendMessageErrorCode);
-                ErrorCode = sendMessageErrorCode;
-                return sendMessagePrepareResult;
-            }
-
-            /// <inheritdoc />
-            protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
-                SocketAsyncContext context,
-                SocketAsyncEngine engine,
-                out ulong userData)
-            {
-                userData = 0;
-                if (SocketAddress.Length == 0)
-                {
-                    if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
-                    {
-                        return IoUringDirectPrepareResult.PrepareFailed;
-                    }
-
-                    if (rawBuffer is not null)
-                    {
-                        rawBuffer += Offset;
-                    }
-
-                    IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectSendWithZeroCopyFallback(
-                        heldSqLock, context._socket,
-                        rawBuffer,
-                        Count,
-                        Flags,
-                        out bool usedZeroCopy,
-                        out userData,
-                        out SocketError errorCode);
-                    ErrorCode = errorCode;
-                    if (usedZeroCopy && prepareResult == IoUringDirectPrepareResult.Prepared)
-                    {
-                        engine.TransferIoUringZeroCopyPinHold(userData, TransferPinnedBuffer());
-                    }
-
-                    return prepareResult;
-                }
-
-                return IoUringPrepareDirectSendMessage(heldSqLock, context, engine, out userData);
-            }
         }
 
         private sealed partial class BufferListSendOperation
@@ -2303,10 +822,6 @@ namespace System.Net.Sockets
             private int _ioUringPreparedStartOffset = -1;
             private int _ioUringPreparedIovCount;
 
-            /// <inheritdoc />
-            internal override bool ShouldReuseIoUringPreparationResourcesOnPending => true;
-
-            /// <inheritdoc />
             protected override void ReleaseIoUringPreparationResourcesCore()
             {
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
@@ -2316,7 +831,6 @@ namespace System.Net.Sockets
                 _ioUringPreparedIovCount = 0;
             }
 
-            /// <summary>Pins buffer segments starting at BufferIndex/Offset and builds the iovec array.</summary>
             private bool TryPinIoUringBuffers(
                 IList<ArraySegment<byte>> buffers,
                 int startIndex,
@@ -2334,15 +848,10 @@ namespace System.Net.Sockets
                     return true;
                 }
 
-                // Release any existing pinned handles and rented arrays before creating new ones.
-                // This handles the partial-send case where BufferIndex/Offset advanced, causing the
-                // reuse check above to fail while old resources are still held.
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
 
                 if (!TryPinBufferListForIoUring(
-                        buffers,
-                        startIndex,
-                        startOffset,
+                        buffers, startIndex, startOffset,
                         out GCHandle[] pinnedHandles,
                         out Interop.Sys.IOVector[] iovecs,
                         out iovCount,
@@ -2363,14 +872,11 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            /// <summary>Advances the buffer position after a partial send, returning true when all data is sent.</summary>
             private bool AdvanceSendBufferPosition(int bytesSent)
             {
                 IList<ArraySegment<byte>>? buffers = Buffers;
                 if (buffers is null || bytesSent <= 0)
-                {
                     return buffers is null || BufferIndex >= buffers.Count;
-                }
 
                 int remaining = bytesSent;
                 int index = BufferIndex;
@@ -2379,8 +885,6 @@ namespace System.Net.Sockets
                 while (remaining > 0 && index < buffers.Count)
                 {
                     int available = buffers[index].Count - offset;
-                    Debug.Assert(available >= 0, "Unexpected negative buffer availability during io_uring send completion.");
-
                     if (available > remaining)
                     {
                         offset += remaining;
@@ -2397,19 +901,12 @@ namespace System.Net.Sockets
                 return index >= buffers.Count;
             }
 
-            /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
             {
                 userData = 0;
-                if (context.IsPersistentMultishotRecvArmed())
-                {
-                    context.RequestPersistentMultishotRecvCancel();
-                }
-
                 IList<ArraySegment<byte>>? buffers = Buffers;
                 if (buffers is null)
                 {
@@ -2417,23 +914,20 @@ namespace System.Net.Sockets
                     return IoUringDirectPrepareResult.PrepareFailed;
                 }
 
-                if ((uint)BufferIndex > (uint)buffers.Count)
+                if (!TryPinIoUringBuffers(buffers, BufferIndex, Offset, out int iovCount))
+                    return IoUringDirectPrepareResult.PrepareFailed;
+
+                if (!TryConvertSocketFlags(Flags, out uint rwFlags))
                 {
                     ErrorCode = SocketError.Success;
                     return IoUringDirectPrepareResult.PrepareFailed;
                 }
 
-                if (!TryPinIoUringBuffers(buffers, BufferIndex, Offset, out int iovCount))
-                {
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
                 byte* rawSocketAddress = null;
                 if (SocketAddress.Length != 0 && !TryPinIoUringBuffer(SocketAddress, out rawSocketAddress))
-                {
                     return IoUringDirectPrepareResult.PrepareFailed;
-                }
 
+                // Use sendmsg for buffer-list sends
                 Interop.Sys.MessageHeader messageHeader;
                 messageHeader.SocketAddress = rawSocketAddress;
                 messageHeader.SocketAddressLen = SocketAddress.Length;
@@ -2448,50 +942,63 @@ namespace System.Net.Sockets
                     {
                         messageHeader.IOVectors = iovecsPtr;
                         messageHeader.IOVectorCount = iovCount;
-                        // Buffer-list sends can be many small segments (e.g. 4KB chunks). Use
-                        // aggregate payload size for zero-copy eligibility, not per-segment size.
-                        long totalPayloadBytes = 0;
-                        for (int i = 0; i < iovCount; i++)
+
+                        var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpSendMsg);
+                        if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
                         {
-                            totalPayloadBytes += (long)(nuint)iovecs[i].Count;
-                            if (totalPayloadBytes >= int.MaxValue)
-                            {
-                                totalPayloadBytes = int.MaxValue;
-                                break;
-                            }
+                            ErrorCode = setup.ErrorCode;
+                            return setup.PrepareResult;
                         }
 
-                        IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                            heldSqLock, context._socket,
-                            &messageHeader,
-                            (int)totalPayloadBytes,
-                            Flags,
-                            out userData,
-                            out SocketError errorCode);
-                        ErrorCode = errorCode;
-                        return prepareResult;
+                        SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                        sqe->Opcode = IoUringOpSendMsg;
+                        sqe->Flags = setup.SqeFlags;
+                        sqe->Ioprio = IoUringRecvSendPollFirst;
+                        sqe->Fd = setup.SqeFd;
+                        sqe->Off = 0;
+                        sqe->Addr = (ulong)(nuint)(&messageHeader);
+                        sqe->Len = 1;
+                        sqe->RwFlags = rwFlags;
+                        sqe->UserData = setup.UserData;
+
+                        engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                        userData = setup.UserData;
+                        ErrorCode = SocketError.Success;
+                        return IoUringDirectPrepareResult.Prepared;
                     }
                 }
 
+                // Empty buffer list
                 messageHeader.IOVectors = null;
                 messageHeader.IOVectorCount = 0;
-                IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectSendMessageWithZeroCopyFallback(
-                        heldSqLock, context._socket,
-                    &messageHeader,
-                    payloadLength: 0,
-                    Flags,
-                    out userData,
-                    out SocketError zeroIovErrorCode);
-                ErrorCode = zeroIovErrorCode;
-                return zeroIovPrepareResult;
+                var emptySetup = engine.TrySetupDirectSqe(context._socket, IoUringOpSendMsg);
+                if (emptySetup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = emptySetup.ErrorCode;
+                    return emptySetup.PrepareResult;
+                }
+
+                SocketAsyncEngine.IoUringSqe* emptySqe = emptySetup.Sqe;
+                emptySqe->Opcode = IoUringOpSendMsg;
+                emptySqe->Flags = emptySetup.SqeFlags;
+                emptySqe->Ioprio = IoUringRecvSendPollFirst;
+                emptySqe->Fd = emptySetup.SqeFd;
+                emptySqe->Off = 0;
+                emptySqe->Addr = (ulong)(nuint)(&messageHeader);
+                emptySqe->Len = 1;
+                emptySqe->RwFlags = rwFlags;
+                emptySqe->UserData = emptySetup.UserData;
+
+                engine.FinishSubmission(emptySetup.SlotIndex, emptySetup.UserData, this);
+                userData = emptySetup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
             }
 
             internal bool ProcessIoUringCompletionSuccessBufferListSend(int result)
             {
                 if (result == 0)
                 {
-                    // Buffer-list sends can represent empty payloads; only treat result=0 as
-                    // reset when there are still bytes pending across remaining segments.
                     if (HasPendingBufferListSendBytes())
                     {
                         ErrorCode = SocketError.ConnectionReset;
@@ -2502,7 +1009,7 @@ namespace System.Net.Sockets
                     return true;
                 }
 
-                Debug.Assert(result > 0, $"Expected positive io_uring send completion size, got {result}");
+                Debug.Assert(result > 0);
                 BytesTransferred += result;
                 bool complete = AdvanceSendBufferPosition(result);
                 ErrorCode = SocketError.Success;
@@ -2514,20 +1021,14 @@ namespace System.Net.Sockets
             {
                 IList<ArraySegment<byte>>? buffers = Buffers;
                 if (buffers is null || BufferIndex >= buffers.Count)
-                {
                     return false;
-                }
 
                 int index = BufferIndex;
                 int offset = Offset;
                 while (index < buffers.Count)
                 {
                     int available = buffers[index].Count - offset;
-                    if (available > 0)
-                    {
-                        return true;
-                    }
-
+                    if (available > 0) return true;
                     index++;
                     offset = 0;
                 }
@@ -2542,10 +1043,6 @@ namespace System.Net.Sockets
             private MemoryHandle _ioUringPinnedSocketAddress;
             private int _ioUringPinnedSocketAddressActive;
 
-            /// <inheritdoc />
-            internal override bool ShouldReuseIoUringPreparationResourcesOnPending => true;
-
-            /// <inheritdoc />
             protected override unsafe void ReleaseIoUringPreparationResourcesCore()
             {
                 ReleaseIoUringSocketAddressAndMessageHeader(
@@ -2554,9 +1051,72 @@ namespace System.Net.Sockets
                     ref _ioUringMessageHeader);
             }
 
-            /// <summary>Gets a message header buffer and sets the common recvmsg fields.</summary>
-            private unsafe Interop.Sys.MessageHeader* GetOrCreateIoUringReceiveMessageHeader(byte* rawSocketAddress)
+            protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
+                SocketAsyncContext context,
+                SocketAsyncEngine engine,
+                out ulong userData)
             {
+                userData = 0;
+
+                if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
+                    return IoUringDirectPrepareResult.PrepareFailed;
+
+                if (!TryConvertSocketFlags(Flags, out uint rwFlags))
+                {
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.PrepareFailed;
+                }
+
+                if (SetReceivedFlags || SocketAddress.Length != 0)
+                {
+                    // recvmsg path (need socket address or msg_flags)
+                    return IoUringPrepareDirectReceiveMessage(context, engine, rawBuffer, rwFlags, out userData);
+                }
+
+                // Simple recv (connected socket, no flags needed)
+                var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpRecv);
+                if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = setup.ErrorCode;
+                    return setup.PrepareResult;
+                }
+
+                SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                sqe->Opcode = IoUringOpRecv;
+                sqe->Flags = setup.SqeFlags;
+                sqe->Ioprio = IoUringRecvSendPollFirst;
+                sqe->Fd = setup.SqeFd;
+                sqe->Off = 0;
+                sqe->Addr = (ulong)(nuint)rawBuffer;
+                sqe->Len = (uint)Buffer.Length;
+                sqe->RwFlags = rwFlags;
+                sqe->UserData = setup.UserData;
+
+                engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                userData = setup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
+            }
+
+            private unsafe IoUringDirectPrepareResult IoUringPrepareDirectReceiveMessage(
+                SocketAsyncContext context,
+                SocketAsyncEngine engine,
+                byte* rawBuffer,
+                uint rwFlags,
+                out ulong userData)
+            {
+                userData = 0;
+
+                if (!TryPinIoUringSocketAddress(
+                    SocketAddress,
+                    ref _ioUringPinnedSocketAddress,
+                    ref _ioUringPinnedSocketAddressActive,
+                    out byte* rawSocketAddress))
+                {
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.PrepareFailed;
+                }
+
                 Interop.Sys.MessageHeader* messageHeader = (Interop.Sys.MessageHeader*)_ioUringMessageHeader;
                 if (messageHeader is null)
                 {
@@ -2564,266 +1124,47 @@ namespace System.Net.Sockets
                     _ioUringMessageHeader = (IntPtr)messageHeader;
                 }
 
-                InitializeReceiveMessageHeader(messageHeader, rawSocketAddress);
-                return messageHeader;
-            }
-
-            /// <summary>Initializes recvmsg header fields shared by direct preparation variants.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private unsafe void InitializeReceiveMessageHeader(Interop.Sys.MessageHeader* messageHeader, byte* rawSocketAddress)
-            {
                 messageHeader->SocketAddress = rawSocketAddress;
                 messageHeader->SocketAddressLen = SocketAddress.Length;
                 messageHeader->ControlBuffer = null;
                 messageHeader->ControlBufferLen = 0;
                 messageHeader->Flags = SocketFlags.None;
-            }
 
-            /// <summary>Configures a message header with a single iovec entry.</summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private static unsafe void ConfigureSingleIov(
-                Interop.Sys.MessageHeader* messageHeader,
-                byte* rawBuffer,
-                int bufferLength,
-                Interop.Sys.IOVector* iov)
-            {
-                // Keep a single iovec even for zero-length receives so recvmsg preserves
-                // completion-mode readiness probe behavior for zero-byte operations.
-                iov->Base = rawBuffer;
-                iov->Count = (UIntPtr)bufferLength;
-                messageHeader->IOVectors = iov;
-                messageHeader->IOVectorCount = 1;
-            }
-
-            /// <summary>Builds a connected or receive-from recvmsg operation.</summary>
-            private unsafe IoUringDirectPrepareResult IoUringPrepareDirectReceiveMessage(
-                Lock heldSqLock,
-                SocketAsyncContext context,
-                SocketAsyncEngine engine,
-                out ulong userData)
-            {
-                userData = 0;
-                if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
-                {
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                if (!TryPinIoUringSocketAddressForPrepare(
-                    SocketAddress,
-                    ref _ioUringPinnedSocketAddress,
-                    ref _ioUringPinnedSocketAddressActive,
-                    out byte* rawSocketAddress))
-                {
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                Interop.Sys.MessageHeader* messageHeader = GetOrCreateIoUringReceiveMessageHeader(rawSocketAddress);
                 Interop.Sys.IOVector receiveIov;
-                ConfigureSingleIov(messageHeader, rawBuffer, Buffer.Length, &receiveIov);
+                receiveIov.Base = rawBuffer;
+                receiveIov.Count = (UIntPtr)Buffer.Length;
+                messageHeader->IOVectors = &receiveIov;
+                messageHeader->IOVectorCount = 1;
 
-                IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                    context._socket,
-                    messageHeader,
-                    Flags,
-                    out userData,
-                    out SocketError errorCode);
-                ErrorCode = errorCode;
-                return prepareResult;
+                var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpRecvMsg);
+                if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = setup.ErrorCode;
+                    return setup.PrepareResult;
+                }
+
+                SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                sqe->Opcode = IoUringOpRecvMsg;
+                sqe->Flags = setup.SqeFlags;
+                sqe->Ioprio = IoUringRecvSendPollFirst;
+                sqe->Fd = setup.SqeFd;
+                sqe->Off = 0;
+                sqe->Addr = (ulong)(nuint)messageHeader;
+                sqe->Len = 1;
+                sqe->RwFlags = rwFlags;
+                sqe->UserData = setup.UserData;
+
+                engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                userData = setup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
             }
 
-            /// <summary>
-            /// Returns whether this operation shape is eligible for multishot recv submission.
-            /// Eligible: connected TCP receive (no socket address, no recvmsg flags) with non-empty buffer.
-            /// Ineligible: zero-byte probes, recvmsg-based receive paths (SetReceivedFlags/socket address).
-            /// </summary>
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private bool IsEligibleForIoUringMultishotRecv()
-            {
-                if (SetReceivedFlags || SocketAddress.Length != 0)
-                {
-                    return false;
-                }
-
-                // Multishot recv uses IORING_OP_RECV (no msg_flags). Message-oriented sockets
-                // rely on MSG_TRUNC to report truncation, which is not observable in this path.
-                if (SocketPal.GetSockOpt(
-                        AssociatedContext._socket,
-                        SocketOptionLevel.Socket,
-                        SocketOptionName.Type,
-                        out int socketTypeValue) != SocketError.Success)
-                {
-                    // If type probing fails, keep completion correctness by disabling multishot recv.
-                    return false;
-                }
-
-                SocketType socketType = (SocketType)socketTypeValue;
-                if (socketType == SocketType.Dgram ||
-                    socketType == SocketType.Raw ||
-                    socketType == SocketType.Seqpacket)
-                {
-                    return false;
-                }
-
-                return Buffer.Length != 0;
-            }
-
-            /// <inheritdoc />
-            protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
-                SocketAsyncContext context,
-                SocketAsyncEngine engine,
-                out ulong userData)
-            {
-                userData = 0;
-                if (SetReceivedFlags || SocketAddress.Length != 0)
-                {
-                    if (context.IsPersistentMultishotRecvArmed())
-                    {
-                        context.RequestPersistentMultishotRecvCancel();
-                    }
-
-                    SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.OneShot);
-                    IoUringDirectPrepareResult receiveMessagePrepareResult =
-                        IoUringPrepareDirectReceiveMessage(heldSqLock, context, engine, out userData);
-                    if (receiveMessagePrepareResult != IoUringDirectPrepareResult.Prepared || ErrorCode != SocketError.Success)
-                    {
-                        SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.None);
-                    }
-
-                    return receiveMessagePrepareResult;
-                }
-
-                bool allowMultishotRecv = IsEligibleForIoUringMultishotRecv() && engine.SupportsMultishotRecv;
-                if (!allowMultishotRecv && context.IsPersistentMultishotRecvArmed())
-                {
-                    context.RequestPersistentMultishotRecvCancel();
-                }
-
-                SetIoUringReceiveSubmissionMode(
-                    allowMultishotRecv ? IoUringReceiveSubmissionMode.Multishot : IoUringReceiveSubmissionMode.OneShot);
-
-                // Before piggybacking, check the early-buffer for data that may have arrived
-                // between DoTryComplete's check (on ThreadPool) and this prepare (on event loop).
-                // Without this check, piggyback would wait for a CQE that never comes while the
-                // buffer has unconsumed data—a race between ThreadPool buffer consumption and
-                // event loop CQE-driven buffer fill.
-                if (allowMultishotRecv && !SetReceivedFlags && SocketAddress.Length == 0 &&
-                    context.TryConsumeBufferedPersistentMultishotRecvData(Buffer, out int earlyBufferedBytes))
-                {
-                    BytesTransferred = earlyBufferedBytes;
-                    ReceivedFlags = SocketFlags.None;
-                    ErrorCode = SocketError.Success;
-                    userData = 0;
-                    return IoUringDirectPrepareResult.CompletedFromBuffer;
-                }
-
-                // Persistent multishot receive: if one is already armed, attach this operation to
-                // that existing user_data instead of submitting a new recv SQE.
-                if (allowMultishotRecv && context.IsPersistentMultishotRecvArmed())
-                {
-                    ulong armedUserData = context.PersistentMultishotRecvUserData;
-                    bool replaced = armedUserData != 0 &&
-                        engine.TryReplaceIoUringTrackedOperation(armedUserData, this);
-                    if (replaced)
-                    {
-                        userData = armedUserData;
-                        ErrorCode = SocketError.Success;
-                        return IoUringDirectPrepareResult.Prepared;
-                    }
-
-                    // Stale armed-state; clear and submit a fresh SQE below.
-                    context.ClearPersistentMultishotRecvArmed();
-                }
-
-                bool bufferAlreadyPinned = IsIoUringBufferPinned();
-                if (!TryPinIoUringBuffer(Buffer, out byte* rawBuffer))
-                {
-                    ErrorCode = SocketError.Success;
-                    SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.None);
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectRecv(
-                    heldSqLock,
-                    context._socket,
-                    rawBuffer,
-                    Buffer.Length,
-                    Flags,
-                    allowMultishotRecv,
-                    bufferAlreadyPinned,
-                    out userData,
-                    out SocketError errorCode);
-                ErrorCode = errorCode;
-                if (allowMultishotRecv &&
-                    prepareResult == IoUringDirectPrepareResult.Prepared &&
-                    errorCode == SocketError.Success)
-                {
-                    context.SetPersistentMultishotRecvArmed(userData);
-                }
-
-                if (prepareResult != IoUringDirectPrepareResult.Prepared || errorCode != SocketError.Success)
-                {
-                    SetIoUringReceiveSubmissionMode(IoUringReceiveSubmissionMode.None);
-                }
-
-                return prepareResult;
-            }
-
-            internal bool ProcessIoUringCompletionSuccessBufferMemoryReceive(int result, uint auxiliaryData)
+            internal bool ProcessIoUringCompletionSuccessBufferMemoryReceive(int result)
             {
                 BytesTransferred = result;
-                ReceivedFlags = SetReceivedFlags ? (SocketFlags)(int)auxiliaryData : SocketFlags.None;
-                if (result >= 0)
-                {
-                    AssociatedContext.TryMigrateIoUringEngineOnFirstReceiveCompletion();
-                }
-
-                if (SocketAddress.Length != 0)
-                {
-                    int socketAddressLen = IoUringCompletionSocketAddressLen;
-                    if (socketAddressLen < 0)
-                    {
-                        socketAddressLen = 0;
-                    }
-
-                    if ((uint)socketAddressLen > (uint)SocketAddress.Length)
-                    {
-                        socketAddressLen = SocketAddress.Length;
-                    }
-
-                    SocketAddress = SocketAddress.Slice(0, socketAddressLen);
-                }
+                ReceivedFlags = SocketFlags.None;
                 ErrorCode = SocketError.Success;
-                return true;
-            }
-
-            /// <inheritdoc />
-            internal override unsafe bool TryProcessIoUringProvidedBufferCompletion(
-                byte* providedBuffer,
-                int providedBufferLength,
-                int bytesTransferred,
-                ref uint auxiliaryData)
-            {
-                _ = auxiliaryData;
-
-                if (bytesTransferred <= 0)
-                {
-                    return true;
-                }
-
-                if (SetReceivedFlags || SocketAddress.Length != 0)
-                {
-                    return false;
-                }
-
-                if ((uint)bytesTransferred > (uint)providedBufferLength ||
-                    (uint)bytesTransferred > (uint)Buffer.Length)
-                {
-                    return false;
-                }
-
-                new ReadOnlySpan<byte>(providedBuffer, bytesTransferred).CopyTo(Buffer.Span);
                 return true;
             }
         }
@@ -2837,10 +1178,6 @@ namespace System.Net.Sockets
             private int _ioUringPreparedIovCount;
             private int _ioUringPreparedBufferCount = -1;
 
-            /// <inheritdoc />
-            internal override bool ShouldReuseIoUringPreparationResourcesOnPending => true;
-
-            /// <inheritdoc />
             protected override unsafe void ReleaseIoUringPreparationResourcesCore()
             {
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
@@ -2854,7 +1191,6 @@ namespace System.Net.Sockets
                 }
             }
 
-            /// <summary>Pins all buffer segments and builds the iovec array.</summary>
             private bool TryPinIoUringBuffers(IList<ArraySegment<byte>> buffers, out int iovCount)
             {
                 if (_ioUringPinnedBufferHandles is not null &&
@@ -2870,9 +1206,7 @@ namespace System.Net.Sockets
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
 
                 if (!TryPinBufferListForIoUring(
-                        buffers,
-                        startIndex: 0,
-                        startOffset: 0,
+                        buffers, 0, 0,
                         out GCHandle[] pinnedHandles,
                         out Interop.Sys.IOVector[] iovecs,
                         out iovCount,
@@ -2891,9 +1225,7 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
@@ -2907,15 +1239,17 @@ namespace System.Net.Sockets
                 }
 
                 if (!TryPinIoUringBuffers(buffers, out int iovCount))
+                    return IoUringDirectPrepareResult.PrepareFailed;
+
+                if (!TryConvertSocketFlags(Flags, out uint rwFlags))
                 {
+                    ErrorCode = SocketError.Success;
                     return IoUringDirectPrepareResult.PrepareFailed;
                 }
 
                 byte* rawSocketAddress = null;
                 if (SocketAddress.Length != 0 && !TryPinIoUringBuffer(SocketAddress, out rawSocketAddress))
-                {
                     return IoUringDirectPrepareResult.PrepareFailed;
-                }
 
                 Interop.Sys.MessageHeader* messageHeader = (Interop.Sys.MessageHeader*)_ioUringMessageHeader;
                 if (messageHeader is null)
@@ -2937,57 +1271,64 @@ namespace System.Net.Sockets
                     {
                         messageHeader->IOVectors = iovecsPtr;
                         messageHeader->IOVectorCount = iovCount;
-                        IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                            context._socket,
-                            messageHeader,
-                            Flags,
-                            out userData,
-                            out SocketError errorCode);
-                        ErrorCode = errorCode;
-                        return prepareResult;
+
+                        var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpRecvMsg);
+                        if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                        {
+                            ErrorCode = setup.ErrorCode;
+                            return setup.PrepareResult;
+                        }
+
+                        SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                        sqe->Opcode = IoUringOpRecvMsg;
+                        sqe->Flags = setup.SqeFlags;
+                        sqe->Ioprio = IoUringRecvSendPollFirst;
+                        sqe->Fd = setup.SqeFd;
+                        sqe->Off = 0;
+                        sqe->Addr = (ulong)(nuint)messageHeader;
+                        sqe->Len = 1;
+                        sqe->RwFlags = rwFlags;
+                        sqe->UserData = setup.UserData;
+
+                        engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                        userData = setup.UserData;
+                        ErrorCode = SocketError.Success;
+                        return IoUringDirectPrepareResult.Prepared;
                     }
                 }
 
+                // Empty buffer list
                 messageHeader->IOVectors = null;
                 messageHeader->IOVectorCount = 0;
-                IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                    context._socket,
-                    messageHeader,
-                    Flags,
-                    out userData,
-                    out SocketError zeroIovErrorCode);
-                ErrorCode = zeroIovErrorCode;
-                return zeroIovPrepareResult;
+                var emptySetup = engine.TrySetupDirectSqe(context._socket, IoUringOpRecvMsg);
+                if (emptySetup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = emptySetup.ErrorCode;
+                    return emptySetup.PrepareResult;
+                }
+
+                SocketAsyncEngine.IoUringSqe* emptySqe = emptySetup.Sqe;
+                emptySqe->Opcode = IoUringOpRecvMsg;
+                emptySqe->Flags = emptySetup.SqeFlags;
+                emptySqe->Ioprio = IoUringRecvSendPollFirst;
+                emptySqe->Fd = emptySetup.SqeFd;
+                emptySqe->Off = 0;
+                emptySqe->Addr = (ulong)(nuint)messageHeader;
+                emptySqe->Len = 1;
+                emptySqe->RwFlags = 0;
+                emptySqe->UserData = emptySetup.UserData;
+
+                engine.FinishSubmission(emptySetup.SlotIndex, emptySetup.UserData, this);
+                userData = emptySetup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
             }
 
-            internal unsafe bool ProcessIoUringCompletionSuccessBufferListReceive(int result, uint auxiliaryData)
+            internal bool ProcessIoUringCompletionSuccessBufferListReceive(int result)
             {
                 BytesTransferred = result;
-                ReceivedFlags = (SocketFlags)(int)auxiliaryData;
+                ReceivedFlags = SocketFlags.None;
                 ErrorCode = SocketError.Success;
-                if (result >= 0)
-                {
-                    AssociatedContext.TryMigrateIoUringEngineOnFirstReceiveCompletion();
-                }
-
-                if (_ioUringMessageHeader != IntPtr.Zero && SocketAddress.Length != 0)
-                {
-                    int socketAddressLen = IoUringCompletionSocketAddressLen;
-                    if (socketAddressLen < 0)
-                    {
-                        socketAddressLen = 0;
-                    }
-
-                    if ((uint)socketAddressLen > (uint)SocketAddress.Length)
-                    {
-                        socketAddressLen = SocketAddress.Length;
-                    }
-
-                    SocketAddress = SocketAddress.Slice(0, socketAddressLen);
-                }
-
                 return true;
             }
         }
@@ -3005,10 +1346,6 @@ namespace System.Net.Sockets
             private MemoryHandle _ioUringPinnedSocketAddress;
             private int _ioUringPinnedSocketAddressActive;
 
-            /// <inheritdoc />
-            internal override bool ShouldReuseIoUringPreparationResourcesOnPending => true;
-
-            /// <inheritdoc />
             protected override unsafe void ReleaseIoUringPreparationResourcesCore()
             {
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
@@ -3028,7 +1365,6 @@ namespace System.Net.Sockets
                     ref _ioUringMessageHeader);
             }
 
-            /// <summary>Pins buffer segments and builds the iovec array for recvmsg.</summary>
             private bool TryPinIoUringBuffers(IList<ArraySegment<byte>> buffers, out int iovCount)
             {
                 if (_ioUringPinnedBufferHandles is not null &&
@@ -3043,9 +1379,7 @@ namespace System.Net.Sockets
                 ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
 
                 if (!TryPinBufferListForIoUring(
-                        buffers,
-                        startIndex: 0,
-                        startOffset: 0,
+                        buffers, 0, 0,
                         out GCHandle[] pinnedHandles,
                         out Interop.Sys.IOVector[] iovecs,
                         out iovCount,
@@ -3064,53 +1398,41 @@ namespace System.Net.Sockets
                 return true;
             }
 
-            /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
             {
                 userData = 0;
-                if (context.IsPersistentMultishotRecvArmed())
-                {
-                    context.RequestPersistentMultishotRecvCancel();
-                }
-
                 IList<ArraySegment<byte>>? buffers = Buffers;
                 byte* rawBuffer = null;
                 int iovCount;
+
                 if (buffers is not null)
                 {
-                    ReleaseIoUringPinnedBufferForShapeTransition();
                     if (!TryPinIoUringBuffers(buffers, out iovCount))
-                    {
                         return IoUringDirectPrepareResult.PrepareFailed;
-                    }
                 }
                 else
                 {
                     if (!TryPinIoUringBuffer(Buffer, out rawBuffer))
-                    {
                         return IoUringDirectPrepareResult.PrepareFailed;
-                    }
-
-                    if (_ioUringPinnedBufferHandles is not null || _ioUringIovecs is not null)
-                    {
-                        ReleaseIoUringPinnedHandlesAndIovecs(ref _ioUringPinnedBufferHandles, ref _ioUringIovecs, ref _ioUringPinnedHandleCount);
-                        _ioUringPreparedIovCount = 0;
-                        _ioUringPreparedBufferListCount = -1;
-                    }
-
                     iovCount = 1;
                 }
 
-                if (!TryPinIoUringSocketAddressForPrepare(
+                if (!TryPinIoUringSocketAddress(
                     SocketAddress,
                     ref _ioUringPinnedSocketAddress,
                     ref _ioUringPinnedSocketAddressActive,
                     out byte* rawSocketAddress))
                 {
+                    ErrorCode = SocketError.Success;
+                    return IoUringDirectPrepareResult.PrepareFailed;
+                }
+
+                if (!TryConvertSocketFlags(Flags, out uint rwFlags))
+                {
+                    ErrorCode = SocketError.Success;
                     return IoUringDirectPrepareResult.PrepareFailed;
                 }
 
@@ -3126,24 +1448,14 @@ namespace System.Net.Sockets
                 messageHeader->Flags = SocketFlags.None;
 
                 int controlBufferLen = Interop.Sys.GetControlMessageBufferSize(Convert.ToInt32(IsIPv4), Convert.ToInt32(IsIPv6));
-                if (controlBufferLen < 0)
-                {
-                    ErrorCode = SocketError.Success;
-                    return IoUringDirectPrepareResult.PrepareFailed;
-                }
-
-                if (controlBufferLen != 0)
+                if (controlBufferLen > 0)
                 {
                     if (_ioUringControlBuffer == IntPtr.Zero || _ioUringControlBufferLength != controlBufferLen)
                     {
-                        IntPtr controlBuffer = Interlocked.Exchange(ref _ioUringControlBuffer, IntPtr.Zero);
-                        if (controlBuffer != IntPtr.Zero)
-                        {
-                            NativeMemory.Free((void*)controlBuffer);
-                        }
+                        IntPtr oldBuf = Interlocked.Exchange(ref _ioUringControlBuffer, IntPtr.Zero);
+                        if (oldBuf != IntPtr.Zero) NativeMemory.Free((void*)oldBuf);
 
-                        void* rawControlBuffer = NativeMemory.Alloc((nuint)controlBufferLen);
-                        _ioUringControlBuffer = (IntPtr)rawControlBuffer;
+                        _ioUringControlBuffer = (IntPtr)NativeMemory.Alloc((nuint)controlBufferLen);
                         _ioUringControlBufferLength = controlBufferLen;
                     }
 
@@ -3152,13 +1464,6 @@ namespace System.Net.Sockets
                 }
                 else
                 {
-                    IntPtr controlBuffer = Interlocked.Exchange(ref _ioUringControlBuffer, IntPtr.Zero);
-                    if (controlBuffer != IntPtr.Zero)
-                    {
-                        NativeMemory.Free((void*)controlBuffer);
-                    }
-
-                    _ioUringControlBufferLength = 0;
                     messageHeader->ControlBuffer = null;
                     messageHeader->ControlBufferLen = 0;
                 }
@@ -3172,97 +1477,77 @@ namespace System.Net.Sockets
                         {
                             messageHeader->IOVectors = iovecsPtr;
                             messageHeader->IOVectorCount = iovCount;
-                            IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                                context._socket,
-                                messageHeader,
-                                Flags,
-                                out userData,
-                                out SocketError errorCode);
-                            ErrorCode = errorCode;
-                            return prepareResult;
+                            return SubmitRecvMsgSqe(context, engine, messageHeader, rwFlags, out userData);
                         }
                     }
 
                     messageHeader->IOVectors = null;
                     messageHeader->IOVectorCount = 0;
-                    IoUringDirectPrepareResult zeroIovPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                        context._socket,
-                        messageHeader,
-                        Flags,
-                        out userData,
-                        out SocketError zeroIovErrorCode);
-                    ErrorCode = zeroIovErrorCode;
-                    return zeroIovPrepareResult;
+                    return SubmitRecvMsgSqe(context, engine, messageHeader, rwFlags, out userData);
                 }
 
+                // Single buffer path
                 Interop.Sys.IOVector iov;
                 iov.Base = rawBuffer;
                 iov.Count = (UIntPtr)Buffer.Length;
                 messageHeader->IOVectors = &iov;
                 messageHeader->IOVectorCount = 1;
-                IoUringDirectPrepareResult singleBufferPrepareResult = engine.TryPrepareIoUringDirectReceiveMessage(
-                    heldSqLock,
-                    context._socket,
-                    messageHeader,
-                    Flags,
-                    out userData,
-                    out SocketError singleBufferErrorCode);
-                ErrorCode = singleBufferErrorCode;
-                return singleBufferPrepareResult;
+                return SubmitRecvMsgSqe(context, engine, messageHeader, rwFlags, out userData);
             }
 
-            internal unsafe bool ProcessIoUringCompletionSuccessReceiveMessageFrom(int result, uint auxiliaryData)
+            private unsafe IoUringDirectPrepareResult SubmitRecvMsgSqe(
+                SocketAsyncContext context,
+                SocketAsyncEngine engine,
+                Interop.Sys.MessageHeader* messageHeader,
+                uint rwFlags,
+                out ulong userData)
+            {
+                userData = 0;
+                var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpRecvMsg);
+                if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = setup.ErrorCode;
+                    return setup.PrepareResult;
+                }
+
+                SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                sqe->Opcode = IoUringOpRecvMsg;
+                sqe->Flags = setup.SqeFlags;
+                sqe->Ioprio = IoUringRecvSendPollFirst;
+                sqe->Fd = setup.SqeFd;
+                sqe->Off = 0;
+                sqe->Addr = (ulong)(nuint)messageHeader;
+                sqe->Len = 1;
+                sqe->RwFlags = rwFlags;
+                sqe->UserData = setup.UserData;
+
+                engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                userData = setup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
+            }
+
+            internal unsafe bool ProcessIoUringCompletionSuccessReceiveMessageFrom(int result)
             {
                 BytesTransferred = result;
-                ReceivedFlags = (SocketFlags)(int)auxiliaryData;
+                ReceivedFlags = SocketFlags.None;
                 ErrorCode = SocketError.Success;
                 IPPacketInformation = default;
-                if (result >= 0)
-                {
-                    AssociatedContext.TryMigrateIoUringEngineOnFirstReceiveCompletion();
-                }
 
                 if (_ioUringMessageHeader != IntPtr.Zero)
                 {
                     Interop.Sys.MessageHeader* messageHeader = (Interop.Sys.MessageHeader*)_ioUringMessageHeader;
-                    int socketAddressCapacity = SocketAddress.Length;
-                    int socketAddressLen = IoUringCompletionSocketAddressLen;
-                    if (socketAddressLen < 0)
+
+                    if (SocketAddress.Length != 0)
                     {
-                        socketAddressLen = 0;
+                        int socketAddressLen = messageHeader->SocketAddressLen;
+                        if (socketAddressLen < 0) socketAddressLen = 0;
+                        if ((uint)socketAddressLen > (uint)SocketAddress.Length)
+                            socketAddressLen = SocketAddress.Length;
+                        SocketAddress = SocketAddress.Slice(0, socketAddressLen);
                     }
 
-                    if ((uint)socketAddressLen > (uint)socketAddressCapacity)
-                    {
-                        socketAddressLen = socketAddressCapacity;
-                    }
-
-                    if (socketAddressLen == 0 && socketAddressCapacity != 0)
-                    {
-                        socketAddressLen = socketAddressCapacity;
-                        SocketAddress.Span.Clear();
-                    }
-
-                    int controlBufferCapacity = messageHeader->ControlBufferLen;
-                    int controlBufferLen = IoUringCompletionControlBufferLen;
-                    if (controlBufferLen < 0)
-                    {
-                        controlBufferLen = 0;
-                    }
-
-                    if ((uint)controlBufferLen > (uint)controlBufferCapacity)
-                    {
-                        controlBufferLen = controlBufferCapacity;
-                    }
-
-                    messageHeader->SocketAddressLen = socketAddressLen;
-                    messageHeader->ControlBufferLen = controlBufferLen;
-                    messageHeader->Flags = ReceivedFlags;
-
-                    SocketAddress = SocketAddress.Slice(0, socketAddressLen);
-
+                    ReceivedFlags = messageHeader->Flags;
                     IPPacketInformation = SocketPal.GetIoUringIPPacketInformation(messageHeader, IsIPv4, IsIPv6);
                 }
 
@@ -3272,9 +1557,7 @@ namespace System.Net.Sockets
             internal bool ProcessIoUringCompletionErrorReceiveMessageFrom(int result)
             {
                 if (!ProcessIoUringErrorResult(result, out ErrorCode))
-                {
                     return false;
-                }
 
                 IPPacketInformation = default;
                 return true;
@@ -3285,70 +1568,52 @@ namespace System.Net.Sockets
         {
             public int AcceptSocketAddressLength;
 
-            /// <inheritdoc />
             internal override Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.Read;
 
-            /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
             {
                 userData = 0;
                 AcceptSocketAddressLength = SocketAddress.Length;
+
                 if (!TryPinIoUringBuffer(SocketAddress, out byte* rawSocketAddress))
-                {
                     return IoUringDirectPrepareResult.PrepareFailed;
-                }
 
-                if (engine.SupportsMultishotAccept &&
-                    Interlocked.CompareExchange(
-                        ref context._multishotAcceptState,
-                        MultishotAcceptStateArming,
-                        MultishotAcceptStateDisarmed) == MultishotAcceptStateDisarmed)
+                // Pin a stackalloc int for the socklen_t output parameter
+                int socketAddressLen = SocketAddress.Length;
+
+                var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpAccept);
+                if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
                 {
-                    context.EnsureMultishotAcceptQueueInitialized();
-                    IoUringDirectPrepareResult multishotPrepareResult = engine.TryPrepareIoUringDirectMultishotAccept(
-                        heldSqLock,
-                        context._socket,
-                        rawSocketAddress,
-                        SocketAddress.Length,
-                        out userData,
-                        out SocketError multishotErrorCode);
-                    if (multishotPrepareResult == IoUringDirectPrepareResult.Prepared)
-                    {
-                        Debug.Assert(
-                            (byte)(userData >> IoUringUserDataTagShift) == IoUringReservedCompletionTag,
-                            "Multishot accept user_data must be a reserved-completion token.");
-                        Volatile.Write(ref context._multishotAcceptState, unchecked((long)userData));
-                        context.TryCreateReusePortShadowListeners(engine);
-                        ErrorCode = multishotErrorCode;
-                        return multishotPrepareResult;
-                    }
-
-                    context.DisarmMultishotAccept();
+                    ErrorCode = setup.ErrorCode;
+                    return setup.PrepareResult;
                 }
 
-                IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectAccept(
-                    heldSqLock,
-                    context._socket,
-                    rawSocketAddress,
-                    SocketAddress.Length,
-                    out userData,
-                    out SocketError errorCode);
-                ErrorCode = errorCode;
-                return prepareResult;
+                SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                sqe->Opcode = IoUringOpAccept;
+                sqe->Flags = setup.SqeFlags;
+                sqe->Ioprio = 0;
+                sqe->Fd = setup.SqeFd;
+                sqe->Addr = (ulong)(nuint)rawSocketAddress;
+                sqe->Off = 0; // No socklen_t pointer — kernel will fill in the address
+                sqe->Len = 0;
+                sqe->RwFlags = IoUringAcceptFlags;
+                sqe->UserData = setup.UserData;
+
+                engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                userData = setup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
             }
 
-            internal bool ProcessIoUringCompletionSuccessAccept(int result, uint auxiliaryData)
+            internal bool ProcessIoUringCompletionSuccessAccept(int result)
             {
                 AcceptedFileDescriptor = (IntPtr)result;
                 ErrorCode = SocketError.Success;
-                // Keep parity with readiness path: always honor reported address length, including 0.
-                AcceptSocketAddressLength = auxiliaryData > (uint)SocketAddress.Length ? SocketAddress.Length : (int)auxiliaryData;
-                SocketAddress = SocketAddress.Slice(0, AcceptSocketAddressLength);
+                AcceptSocketAddressLength = SocketAddress.Length;
                 return true;
             }
 
@@ -3361,32 +1626,41 @@ namespace System.Net.Sockets
 
         private sealed partial class ConnectOperation
         {
-            /// <inheritdoc />
             internal override Interop.Sys.SocketEvents GetIoUringFallbackSocketEvents() =>
                 Interop.Sys.SocketEvents.Write;
 
-            /// <inheritdoc />
             protected override unsafe IoUringDirectPrepareResult IoUringPrepareDirect(
-                Lock heldSqLock,
                 SocketAsyncContext context,
                 SocketAsyncEngine engine,
                 out ulong userData)
             {
                 userData = 0;
+
                 if (!TryPinIoUringBuffer(SocketAddress, out byte* rawSocketAddress))
-                {
                     return IoUringDirectPrepareResult.PrepareFailed;
+
+                var setup = engine.TrySetupDirectSqe(context._socket, IoUringOpConnect);
+                if (setup.PrepareResult != IoUringDirectPrepareResult.Prepared)
+                {
+                    ErrorCode = setup.ErrorCode;
+                    return setup.PrepareResult;
                 }
 
-                IoUringDirectPrepareResult prepareResult = engine.TryPrepareIoUringDirectConnect(
-                    heldSqLock,
-                    context._socket,
-                    rawSocketAddress,
-                    SocketAddress.Length,
-                    out userData,
-                    out SocketError errorCode);
-                ErrorCode = errorCode;
-                return prepareResult;
+                SocketAsyncEngine.IoUringSqe* sqe = setup.Sqe;
+                sqe->Opcode = IoUringOpConnect;
+                sqe->Flags = setup.SqeFlags;
+                sqe->Ioprio = 0;
+                sqe->Fd = setup.SqeFd;
+                sqe->Addr = (ulong)(nuint)rawSocketAddress;
+                sqe->Off = (uint)SocketAddress.Length;
+                sqe->Len = 0;
+                sqe->RwFlags = 0;
+                sqe->UserData = setup.UserData;
+
+                engine.FinishSubmission(setup.SlotIndex, setup.UserData, this);
+                userData = setup.UserData;
+                ErrorCode = SocketError.Success;
+                return IoUringDirectPrepareResult.Prepared;
             }
 
             internal bool ProcessIoUringCompletionErrorConnect(SocketAsyncContext context, int result)
@@ -3399,9 +1673,7 @@ namespace System.Net.Sockets
                 }
 
                 if (!ProcessIoUringCompletionErrorWrite(result))
-                {
                     return false;
-                }
 
                 context._socket.RegisterConnectResult(ErrorCode);
                 return true;
@@ -3419,7 +1691,6 @@ namespace System.Net.Sockets
                     SocketError error = context.SendToAsync(Buffer, 0, Buffer.Length, SocketFlags.None, default, ref BytesTransferred, callback!, default);
                     if (error == SocketError.IOPending)
                     {
-                        // Callback ownership moved to the async send operation.
                         Callback = null;
                         Buffer = default;
                     }
@@ -3431,8 +1702,6 @@ namespace System.Net.Sockets
                             context._socket.RegisterConnectResult(ErrorCode);
                         }
 
-                        // Follow-up send completed synchronously (success/error), so invoke
-                        // Connect callback from this operation path.
                         Buffer = default;
                     }
                 }
@@ -3442,12 +1711,7 @@ namespace System.Net.Sockets
         }
 
         // ===================================================================
-        // io_uring async dispatch implementations (partial methods declared
-        // in SocketAsyncContext.Unix.cs). Each method skips SetHandleNonBlocking
-        // (socket stays blocking for FAST_POLL) and skips the synchronous try
-        // (would block on a blocking socket). Instead, the operation is
-        // unconditionally enqueued and io_uring submission happens via
-        // LinuxTryStageIoUringOperation inside StartAsyncOperation.
+        // io_uring async dispatch implementations
         // ===================================================================
 
         private partial SocketError IoUringAcceptAsync(Memory<byte> socketAddress, out int socketAddressLen, out IntPtr acceptedFd, Action<IntPtr, Memory<byte>, SocketError> callback, CancellationToken cancellationToken)
@@ -3475,9 +1739,6 @@ namespace System.Net.Sockets
 
         private partial SocketError IoUringConnectAsync(Memory<byte> socketAddress, Action<int, Memory<byte>, SocketFlags, SocketError> callback, Memory<byte> buffer, out int sentBytes, CancellationToken cancellationToken)
         {
-            // Connect is different than the usual "readiness" pattern of other operations.
-            // We need to initiate the connect before we try to complete it.
-            // Thus, always call TryStartConnect regardless of readiness.
             SocketError errorCode;
             int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
             if (SocketPal.TryStartConnect(_socket, socketAddress, out errorCode, buffer.Span, false, out sentBytes))
@@ -3485,7 +1746,6 @@ namespace System.Net.Sockets
                 _socket.RegisterConnectResult(errorCode);
 
                 int remains = buffer.Length - sentBytes;
-
                 if (errorCode == SocketError.Success && remains > 0)
                 {
                     errorCode = SendToAsync(buffer.Slice(sentBytes), 0, remains, SocketFlags.None, Memory<byte>.Empty, ref sentBytes, callback!, default);
@@ -3651,18 +1911,16 @@ namespace System.Net.Sockets
         private partial SocketError IoUringSendToAsync(IList<ArraySegment<byte>> buffers, SocketFlags flags, Memory<byte> socketAddress, out int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
             bytesSent = 0;
-            int bufferIndex = 0;
-            int offset = 0;
             int observedSequenceNumber = _sendQueue.GetCurrentSequenceNumber();
 
             BufferListSendOperation operation = RentBufferListSendOperation();
             operation.Callback = callback;
             operation.Buffers = buffers;
-            operation.BufferIndex = bufferIndex;
-            operation.Offset = offset;
+            operation.BufferIndex = 0;
+            operation.Offset = 0;
             operation.Flags = flags;
             operation.SocketAddress = socketAddress;
-            operation.BytesTransferred = bytesSent;
+            operation.BytesTransferred = 0;
 
             if (!_sendQueue.StartAsyncOperation(this, operation, observedSequenceNumber))
             {
@@ -3698,6 +1956,10 @@ namespace System.Net.Sockets
 
             return SocketError.IOPending;
         }
+
+        // ===================================================================
+        // OperationQueue extensions for io_uring
+        // ===================================================================
 
         private partial struct OperationQueue<TOperation>
             where TOperation : AsyncOperation

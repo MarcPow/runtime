@@ -44,6 +44,7 @@ namespace System.Net.Sockets
         private int _liveAcceptCompletionSlotCount;
         private int _trackedIoUringOperationCount;
         private int _ioUringSlotCapacity;
+        private System.Buffers.MemoryHandle[]? _zeroCopyPinHolds;
 
         // ---- Capabilities ----
         private LinuxIoUringCapabilities _ioUringCapabilities;
@@ -116,18 +117,20 @@ namespace System.Net.Sockets
             InitializeCompletionSlotPool(slotCapacity);
 
             // Create eventfd for CQ notifications
-            int eventFd = Interop.Sys.EventFd(0, Interop.Sys.EventFdFlags.EFD_CLOEXEC | Interop.Sys.EventFdFlags.EFD_NONBLOCK);
-            if (eventFd < 0)
+            int eventFd;
+            Interop.Error createEventFdError = Interop.Sys.IoUringShimCreateEventFd(&eventFd);
+            if (createEventFdError != Interop.Error.SUCCESS)
             {
                 CleanupManagedRings();
                 return false;
             }
 
-            // Register eventfd with io_uring
-            Interop.Error regError = Interop.Sys.IoUringShimRegisterEventfd(setupResult.RingFd, eventFd);
+            // Register eventfd with io_uring (IORING_REGISTER_EVENTFD = 4)
+            int regResult;
+            Interop.Error regError = Interop.Sys.IoUringShimRegister(setupResult.RingFd, 4, &eventFd, 1, &regResult);
             if (regError != Interop.Error.SUCCESS)
             {
-                Interop.Sys.Close((IntPtr)eventFd);
+                Interop.Sys.IoUringShimCloseFd(eventFd);
                 CleanupManagedRings();
                 return false;
             }
@@ -194,6 +197,7 @@ namespace System.Net.Sockets
             SafeSocketHandle socket,
             byte opcode)
         {
+            _ = opcode; // Reserved for future opcode-specific validation
             IoUringDirectSqeSetupResult setup = default;
             setup.SlotIndex = -1;
             setup.PrepareResult = SocketAsyncContext.AsyncOperation.IoUringDirectPrepareResult.Unsupported;
@@ -346,7 +350,7 @@ namespace System.Net.Sockets
             if (_ringState.WakeupEventFd >= 0)
             {
                 ulong val;
-                Interop.Sys.Read((IntPtr)_ringState.WakeupEventFd, (byte*)&val, 8);
+                Interop.Sys.IoUringShimReadEventFd(_ringState.WakeupEventFd, &val);
             }
 
             // Drain CQ ring
@@ -507,8 +511,9 @@ namespace System.Net.Sockets
             // Probe kernel for supported opcodes
             const int probeSize = 256;
             byte* probeBuffer = stackalloc byte[16 + probeSize * 8];
+            int probeResult;
             Interop.Error probeError = Interop.Sys.IoUringShimRegister(
-                ringFd, IoUringConstants.RegisterProbe, probeBuffer, (uint)probeSize);
+                ringFd, IoUringConstants.RegisterProbe, probeBuffer, (uint)probeSize, &probeResult);
 
             if (probeError != Interop.Error.SUCCESS)
                 return;

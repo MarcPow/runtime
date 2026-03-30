@@ -301,7 +301,6 @@ namespace System.Net.Sockets
             internal Interop.Sys.IoUringParams Params;
             internal uint NegotiatedFlags;
             internal bool UsesExtArg;
-            internal bool SqPollNegotiated;
         }
 
         /// <summary>Discriminates completion slot metadata shape for operation-specific post-completion processing.</summary>

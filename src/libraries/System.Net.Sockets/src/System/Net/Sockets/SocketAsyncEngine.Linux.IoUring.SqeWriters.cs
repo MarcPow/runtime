@@ -183,7 +183,7 @@ namespace System.Net.Sockets
             sqe->Ioprio = 0; // Not used by ASYNC_CANCEL.
             sqe->Fd = -1;
             sqe->Off = 0; // Not used by ASYNC_CANCEL.
-            Debug.Assert((byte)(userData >> IoUringUserDataTagShift) == IoUringConstants.TagReservedCompletion);
+            Debug.Assert((byte)(userData >> 56) == IoUringConstants.TagReservedCompletion);
             sqe->Addr = userData;
             sqe->Len = 0; // Not used by ASYNC_CANCEL.
             sqe->RwFlags = 0; // Not used by ASYNC_CANCEL.

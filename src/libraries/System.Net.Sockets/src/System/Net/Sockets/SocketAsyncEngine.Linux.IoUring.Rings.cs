@@ -167,8 +167,6 @@ namespace System.Net.Sockets
                 $"Unexpected CQ mask/entries contract: cq_mask={_ringState.CqMask}, cq_entries={_ringState.CqEntries}");
 
             _ringState.ObservedCqOverflow = Volatile.Read(ref *_ringState.CqOverflowPtr);
-            _cqOverflowRecoveryActive = false;
-            _cqOverflowRecoveryBranch = default;
 
             // Store ring region info for teardown.
             _ringState.SqRingPtr = sqRingPtr;
@@ -252,9 +250,6 @@ namespace System.Net.Sockets
             // unregister operations need the ring fd to still be open.
             if (_ioUringInitialized)
             {
-                // 0. Unregister/dispose provided buffer ring while the main ring fd is still open.
-                FreeIoUringProvidedBufferRing();
-
                 // 1. The registered ring fd is implicitly released when the ring fd is closed.
                 //    Just mark it as inactive so no subsequent code attempts to use it.
                 _ioUringSqRingInfo.RegisteredRingFd = -1;
@@ -275,20 +270,8 @@ namespace System.Net.Sockets
                 _ringState.CqDrainEnabled = false;
             }
 
-            bool portClosedForTeardown = Volatile.Read(ref _ioUringPortClosedForTeardown) != 0;
-            if (!portClosedForTeardown)
-            {
-                PollIoUringDiagnosticsIfNeeded(force: true);
-            }
-
-            // Second drain intentionally catches any items enqueued after LinuxBeforeFreeNativeResources
-            // published teardown but before native port closure became globally visible.
-            DrainQueuedIoUringOperationsForTeardown();
-
             if (_completionSlots is not null)
             {
-                DrainTrackedIoUringOperationsForTeardown(portClosedForTeardown);
-                Debug.Assert(IsIoUringTrackingEmpty(), $"Leaked tracked io_uring operations: {Volatile.Read(ref _trackedIoUringOperationCount)}");
 
                 // Free any native memory still held by completion slots
                 for (int i = 0; i < _completionSlots.Length; i++)
@@ -336,14 +319,8 @@ namespace System.Net.Sockets
                 _liveAcceptCompletionSlotCount = 0;
 
                 _ioUringSlotCapacity = 0;
-                _cqOverflowRecoveryActive = false;
-                _cqOverflowRecoveryBranch = default;
-                _ioUringManagedPendingSubmissions = 0;
-                _ioUringManagedSqTail = 0;
-                _ioUringManagedSqTailLoaded = false;
                 _ioUringSqRingInfo = default;
                 _ioUringDirectSqeEnabled = false;
-                _sqPollEnabled = false;
 
             }
 
@@ -354,9 +331,7 @@ namespace System.Net.Sockets
                 _completionSlotNativeStorageStride = 0;
             }
 
-            // Final flush of managed io_uring deltas in case teardown modified counters
-            // after the forced diagnostics poll and no further event-loop iteration runs.
-            PublishIoUringManagedDiagnosticsDelta();
+            // Teardown complete.
         }
     }
 }

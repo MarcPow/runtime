@@ -129,12 +129,22 @@ namespace System.Net.Sockets
         /// <summary>
         /// Allocates a completion slot from the free list. Returns the slot index,
         /// or -1 if the pool is exhausted (backpressure signal).
-        /// Caller must hold <see cref="_sqSubmitLock"/>.
+        /// Caller must hold <see cref="_sqLock"/>.
         /// </summary>
+        /// <summary>Parameterless overload; caller must already hold _sqLock.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int AllocateCompletionSlot() => AllocateCompletionSlotCore();
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private int AllocateCompletionSlot(Lock heldSqLock)
         {
             Debug.Assert(heldSqLock.IsHeldByCurrentThread);
+            return AllocateCompletionSlotCore();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int AllocateCompletionSlotCore()
+        {
             Debug.Assert(_completionSlots is not null);
             int index = _completionSlotFreeListHead;
             if (index < 0)
@@ -156,7 +166,7 @@ namespace System.Net.Sockets
         /// <summary>
         /// Returns a completion slot to the free list, incrementing its generation
         /// to invalidate any stale user_data references.
-        /// The free-list push at the end is protected by <see cref="_sqSubmitLock"/>.
+        /// The free-list push at the end is protected by <see cref="_sqLock"/>.
         /// </summary>
         private unsafe void FreeCompletionSlot(int index)
         {
@@ -186,15 +196,6 @@ namespace System.Net.Sockets
             }
             finally
             {
-                if (slot.UsesFixedRecvBuffer)
-                {
-                    IoUringProvidedBufferRing? providedBufferRing = _ioUringProvidedBufferRing;
-                    if (providedBufferRing is not null)
-                    {
-                        providedBufferRing.TryRecycleBufferFromCompletion(slot.FixedRecvBufferId);
-                    }
-                }
-
                 // Free any native message storage
                 if (slot.Kind == IoUringCompletionOperationKind.Message)
                 {
@@ -216,7 +217,7 @@ namespace System.Net.Sockets
                 // Lock covers generation bump + state reset + free-list push atomically.
                 // Without this, a user thread could AllocateCompletionSlot between the
                 // generation bump and the free-list push, seeing a stale generation.
-                lock (_sqSubmitLock)
+                lock (_sqLock)
                 {
                     slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
                     if (slot.Generation == 0)
@@ -224,7 +225,9 @@ namespace System.Net.Sockets
                         slot.Generation = 1;
                     }
                     SetCompletionSlotKind(ref slot, IoUringCompletionOperationKind.None);
-                    ResetDebugTestForcedResult(ref slot);
+#if DEBUG
+                    slot.HasTestForcedResult = false;
+#endif
                     slot.ClearZeroCopyState();
                     slot.UsesFixedRecvBuffer = false;
                     slot.FixedRecvBufferId = 0;
@@ -237,6 +240,22 @@ namespace System.Net.Sockets
             }
 
             dangerousReleaseException?.Throw();
+        }
+
+        /// <summary>
+        /// Simplified free that runs while the caller already holds _sqLock.
+        /// Used by TrySetupDirectSqe / AbortSubmission error paths where no
+        /// tracked operation or DangerousRef has been installed yet.
+        /// </summary>
+        private void FreeCompletionSlotUnderLock(int index)
+        {
+            Debug.Assert(index >= 0 && index < _completionSlots!.Length);
+            ref IoUringCompletionSlot slot = ref _completionSlots![index];
+            slot.Generation = (slot.Generation + 1UL) & IoUringConstants.GenerationMask;
+            if (slot.Generation == 0) slot.Generation = 1;
+            slot.FreeListNext = _completionSlotFreeListHead;
+            _completionSlotFreeListHead = index;
+            _completionSlotsInUse--;
         }
 
         /// <summary>Disposes a retained zero-copy pin-hold for the specified completion slot.</summary>
@@ -265,7 +284,7 @@ namespace System.Net.Sockets
                 return;
             }
 
-            int slotIndex = DecodeCompletionSlotIndex(userData & IoUringUserDataPayloadMask);
+            int slotIndex = DecodeCompletionSlotIndex(userData & 0x00FF_FFFF_FFFF_FFFFUL);
             if ((uint)slotIndex >= (uint)pinHolds.Length)
             {
                 pinHold.Dispose();

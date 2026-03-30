@@ -11,6 +11,27 @@ namespace System.Net.Sockets
 {
     internal sealed unsafe partial class SocketAsyncEngine
     {
+        // Environment variable names for io_uring configuration
+        private const string IoUringEnvironmentVariable = "DOTNET_SYSTEM_NET_SOCKETS_IOURING";
+        private const string IoUringSqPollEnvironmentVariable = "DOTNET_SYSTEM_NET_SOCKETS_IOURING_SQPOLL";
+        private const string IoUringDisableMultishotAcceptEnvironmentVariable = "DOTNET_SYSTEM_NET_SOCKETS_IOURING_DISABLE_MULTISHOT_ACCEPT";
+        private const string IoUringDisableReusePortAcceptEnvironmentVariable = "DOTNET_SYSTEM_NET_SOCKETS_IOURING_DISABLE_REUSEPORT_ACCEPT";
+
+        // Static configuration defaults (simplified: no provided buffers, no MPSC queues)
+        private const bool s_ioUringRegisterBuffersEnabled = false;
+        private const bool s_ioUringAdaptiveBufferSizingEnabled = false;
+        private const int s_ioUringProvidedBufferSize = 0;
+        private const int s_ioUringPrepareQueueCapacity = 0;
+        private const int s_ioUringCancellationQueueCapacity = 0;
+
+#if DEBUG
+        private static class IoUringTestEnvironmentVariables
+        {
+            internal const string DirectSqe = "DOTNET_SYSTEM_NET_SOCKETS_IOURING_TEST_DIRECTSQE";
+            internal const string ZeroCopySend = "DOTNET_SYSTEM_NET_SOCKETS_IOURING_TEST_ZEROCOPY";
+        }
+#endif
+
         /// <summary>Parses an environment variable as a "0"/"1" boolean switch. Returns null if unset or unrecognized.</summary>
         private static bool? TryParseBoolSwitch(string? value)
         {
@@ -48,6 +69,10 @@ namespace System.Net.Sockets
         // One-time static lookup per process, following the standard .NET pattern
         // (e.g. GlobalizationMode). Configuration is not expected to change mid-process.
         private static readonly IoUringConfigurationInputs s_cachedConfigInputs = ReadIoUringConfigurationInputs();
+
+        /// <summary>Alias used by the engine init path.</summary>
+        private static IoUringResolvedConfiguration ResolveIoUringConfiguration() =>
+            ResolveIoUringResolvedConfiguration();
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static IoUringResolvedConfiguration ResolveIoUringResolvedConfiguration()

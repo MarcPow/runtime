@@ -57,7 +57,21 @@ the lock — the kernel handles concurrent enter() calls.
 - Azure VM `74.249.210.155`: 8-core (available)
 - WSL2 local: kernel 6.6 — works with raw io_uring (C and C#)
 
-## Next Step
-Rip out the complex event loop from the original PR. Replace with the
-simple eventfd model. Keep the partial class dispatch pattern for clean
-isolation from Unix.cs.
+## Progress on Rewrite
+
+### Done:
+- Deleted 5 files (MpscQueue, ProvidedBufferRing, Diagnostics, TestHookStubs, CompletionDispatch) — 2,448 lines
+- Extracted types/constants into dedicated files
+- Renamed all files to `SocketAsyncEngine.Linux.IoUring.X.cs` pattern
+- Rewrote `SocketAsyncEngine.Linux.cs` (4,789 → ~400 lines)
+- Net: +1,203 -7,341 lines so far
+
+### Remaining:
+- Rewrite `SocketAsyncContext.Linux.IoUring.cs` (3,762 lines) to use new engine API
+  - 33 references to deleted engine methods
+  - Cut multishot accept/recv, shadow listeners, complex buffer management
+  - Keep: IoUring*Async dispatchers, completion processing, basic operation tracking
+  - Target: ~800 lines
+- Fix remaining 15 build errors (all in this one file)
+- Clean up Slots.cs and Rings.cs references to deleted features
+- Test locally and on Azure VM
