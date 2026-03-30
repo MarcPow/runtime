@@ -28,6 +28,10 @@ namespace System.Net.Sockets
 
         // ---- SQ submission ----
         private readonly Lock _sqLock = new Lock();
+
+        // ---- CQ drain serialization ----
+        private readonly Lock _cqDrainLock = new Lock();
+        private readonly bool _inlineCqDrain = Environment.ProcessorCount <= 4;
         private uint _sqTail;
         private bool _sqTailLoaded;
 
@@ -278,6 +282,11 @@ namespace System.Net.Sockets
 
             // Submit to kernel (outside lock)
             IoUringEnter(1, 0);
+
+            // On low-core machines, inline CQ drain avoids context switch to eventfd poller.
+            // On high-core machines, skip — let the eventfd poller drain concurrently.
+            if (_inlineCqDrain)
+                TryDrainCompletionsInline();
         }
 
         /// <summary>Aborts a prepared SQE — releases socket ref, frees slot, undoes SQ bump.</summary>
@@ -353,8 +362,45 @@ namespace System.Net.Sockets
                 Interop.Sys.IoUringShimReadEventFd(_ringState.WakeupEventFd, &val);
             }
 
-            // Drain CQ ring
-            while (true)
+            _cqDrainLock.Enter();
+            try
+            {
+                DrainCqRingUnderLock(int.MaxValue);
+            }
+            finally
+            {
+                _cqDrainLock.Exit();
+            }
+        }
+
+        /// <summary>
+        /// Opportunistically drains CQEs inline after submission, avoiding a context
+        /// switch to the eventfd poller thread. Common fast path on low-core machines.
+        /// </summary>
+        private void TryDrainCompletionsInline()
+        {
+            // Lockless peek — if CQ ring is empty, skip entirely (zero sync cost)
+            uint peekHead = Volatile.Read(ref *_ringState.CqHeadPtr);
+            uint peekTail = Volatile.Read(ref *_ringState.CqTailPtr);
+            if (peekHead == peekTail)
+                return;
+
+            _cqDrainLock.Enter();
+            try
+            {
+                DrainCqRingUnderLock(16); // Cap to avoid starving the submitting thread
+            }
+            finally
+            {
+                _cqDrainLock.Exit();
+            }
+        }
+
+        /// <summary>Drains up to maxCqes CQEs from the CQ ring. Caller must hold _cqDrainLock.</summary>
+        private void DrainCqRingUnderLock(int maxCqes)
+        {
+            int drained = 0;
+            while (drained < maxCqes)
             {
                 uint head = Volatile.Read(ref *_ringState.CqHeadPtr);
                 uint tail = Volatile.Read(ref *_ringState.CqTailPtr);
@@ -366,8 +412,8 @@ namespace System.Net.Sockets
                 uint flags = cqe->Flags;
                 Volatile.Write(ref *_ringState.CqHeadPtr, head + 1);
 
-                // Dispatch the completion
                 DispatchCompletion(userData, result, flags);
+                drained++;
             }
         }
 
