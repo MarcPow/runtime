@@ -200,24 +200,15 @@
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix' or '$(TargetPlatformIdentifier)' == 'osx' or '$(TargetPlatformIdentifier)' == 'ios' or '$(TargetPlatformIdentifier)' == 'tvos'">
     <Compile Include="System\Net\Sockets\UnixDomainSocketEndPoint.Unix.cs"/>
     <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringConfiguration.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringSqeWriters.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringCompletionDispatch.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringSlots.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringRings.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringDiagnostics.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="..\tests\FunctionalTests\IoUringTestInfrastructure\SocketAsyncEngine.IoUringTestHooks.Linux.cs"
-             Link="System\Net\Sockets\SocketAsyncEngine.IoUringTestHooks.Linux.cs"
-             Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux' and '$(Configuration)' == 'Debug'" />
-    <Compile Include="..\tests\FunctionalTests\IoUringTestInfrastructure\SocketAsyncEngine.IoUringTestAccessors.Linux.cs"
-             Link="System\Net\Sockets\SocketAsyncEngine.IoUringTestAccessors.Linux.cs"
-             Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux' and '$(Configuration)' == 'Debug'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncEngine.IoUringTestHooks.Stubs.Linux.cs"
-             Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux' and '$(Configuration)' != 'Debug'" />
-    <Compile Include="System\Net\Sockets\MpscQueue.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\IoUringProvidedBufferRing.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketPal.IoUring.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
-    <Compile Include="System\Net\Sockets\SocketAsyncContext.IoUring.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Types.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Constants.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Configuration.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.SqeWriters.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <!-- CompletionDispatch deleted — CQ drain is in SocketAsyncEngine.Linux.cs -->
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Slots.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Rings.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketPal.Linux.IoUring.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.IoUring.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="System\Net\Sockets\SocketAsyncEngine.Unix.cs" />
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.SocketEvent.cs"
              Link="Common\Interop\Unix\System.Native\Interop.SocketEvent.cs" />
