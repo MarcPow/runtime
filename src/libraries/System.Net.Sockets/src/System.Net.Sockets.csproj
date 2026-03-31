@@ -209,6 +209,8 @@
     <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.Rings.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="System\Net\Sockets\SocketPal.Linux.IoUring.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.IoUring.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.IoUring.MultishotRecv.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="System\Net\Sockets\SocketAsyncEngine.Linux.IoUring.MultishotRecv.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="System\Net\Sockets\SocketAsyncEngine.Unix.cs" />
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.SocketEvent.cs"
              Link="Common\Interop\Unix\System.Native\Interop.SocketEvent.cs" />

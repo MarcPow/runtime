@@ -1784,6 +1784,25 @@ namespace System.Net.Sockets
             operation.Flags = flags;
             operation.SocketAddress = default;
 
+            // Multishot recv fast path: arm on first recv, then check for pre-received data or register as pending.
+            // Only for simple recv (no flags, connected socket).
+            if (flags == SocketFlags.None && (_multishotRecvArmed || TryArmMultishotRecv()))
+            {
+                if (TryMultishotRecvFastPath(operation))
+                {
+                    if (operation.ErrorCode == SocketError.Success && operation.BytesTransferred > 0)
+                    {
+                        // Completed synchronously from queued data
+                        bytesReceived = operation.BytesTransferred;
+                        ReturnOperation(operation);
+                        return SocketError.Success;
+                    }
+                    // Registered as pending — will be completed by multishot CQE
+                    bytesReceived = 0;
+                    return SocketError.IOPending;
+                }
+            }
+
             if (!_receiveQueue.StartAsyncOperation(this, operation, observedSequenceNumber, cancellationToken))
             {
                 bytesReceived = operation.BytesTransferred;

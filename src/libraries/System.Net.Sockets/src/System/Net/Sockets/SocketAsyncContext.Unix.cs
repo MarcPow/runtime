@@ -1517,6 +1517,9 @@ namespace System.Net.Sockets
             Debug.Assert(socketAddress.Length > 0, $"Unexpected socketAddressLen: {socketAddress.Length}");
             Debug.Assert(callback != null, "Expected non-null callback");
 
+            if (_isIoUringActive)
+                return IoUringAcceptAsync(socketAddress, out socketAddressLen, out acceptedFd, callback, cancellationToken);
+
             SetHandleNonBlocking();
 
             SocketError errorCode;
@@ -1722,6 +1725,9 @@ namespace System.Net.Sockets
 
         public SocketError ReceiveAsync(Memory<byte> buffer, SocketFlags flags, out int bytesReceived, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken = default)
         {
+            if (_isIoUringActive)
+                return IoUringReceiveAsync(buffer, flags, out bytesReceived, callback, cancellationToken);
+
             SetHandleNonBlocking();
 
             SocketError errorCode;
@@ -2066,6 +2072,9 @@ namespace System.Net.Sockets
 
         public SocketError SendToAsync(Memory<byte> buffer, int offset, int count, SocketFlags flags, Memory<byte> socketAddress, ref int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken = default)
         {
+            if (_isIoUringActive)
+                return IoUringSendToAsync(buffer, offset, count, flags, socketAddress, ref bytesSent, callback, cancellationToken);
+
             SetHandleNonBlocking();
 
             SocketError errorCode;

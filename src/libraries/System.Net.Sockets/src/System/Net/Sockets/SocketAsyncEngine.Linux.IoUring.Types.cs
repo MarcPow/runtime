@@ -439,6 +439,8 @@ namespace System.Net.Sockets
             // ReusePortAccept metadata - cross-engine references for shadow listener accept forwarding
             public SocketAsyncContext? ReusePortPrimaryContext;
             public SocketAsyncEngine? ReusePortPrimaryEngine;
+            // Multishot recv tracking
+            public bool IsMultishot;
         }
 
         /// <summary>

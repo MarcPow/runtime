@@ -90,15 +90,26 @@ namespace System.Net.Sockets
         /// </summary>
         partial void LinuxDetectAndInitializeIoUring()
         {
+            IoUringDiag($"LinuxDetectAndInitializeIoUring: kernel={Environment.OSVersion}");
             if (!IsIoUringKernelVersionSupported())
+            {
+                IoUringDiag("Kernel version not supported");
                 return;
+            }
 
             IoUringResolvedConfiguration resolvedConfiguration = ResolveIoUringConfiguration();
             if (!resolvedConfiguration.IoUringEnabled)
+            {
+                IoUringDiag("io_uring disabled by configuration");
                 return;
+            }
 
+            IoUringDiag("Attempting TryInitializeIoUringCompletionMode");
             if (!TryInitializeIoUringCompletionMode(resolvedConfiguration))
+            {
+                IoUringDiag("TryInitializeIoUringCompletionMode failed");
                 return;
+            }
 
             _ioUringInitialized = true;
         }
@@ -158,6 +169,9 @@ namespace System.Net.Sockets
                 .WithIsIoUringPort(true)
                 .WithMode(IoUringMode.Completion)
                 .WithSupportsMultishotAccept(_supportsMultishotAccept);
+
+            // Set up provided buffer ring for multishot recv (impl in IoUring.MultishotRecv.cs)
+            TrySetupProvidedBufferRing(setupResult.RingFd);
 
             // Register the eventfd with the epoll-based event loop so ThreadPool
             // workers wake up when CQEs arrive.
@@ -280,8 +294,10 @@ namespace System.Net.Sockets
             PublishSqTail();
             _sqLock.Exit();
 
-            // Submit to kernel (outside lock)
-            IoUringEnter(1, 0);
+            // Submit to kernel (outside lock). Pass QueueEntries so this call also
+            // submits any SQEs published by concurrent threads — the kernel processes
+            // from SQ head to min(head+submit, tail), so this is free when only 1 is pending.
+            IoUringEnter(IoUringConstants.QueueEntries, 0);
 
             // On low-core machines, inline CQ drain avoids context switch to eventfd poller.
             // On high-core machines, skip — let the eventfd poller drain concurrently.
@@ -436,6 +452,14 @@ namespace System.Net.Sockets
             if (slot.Generation != generation)
                 return; // Stale CQE
 
+            // Multishot CQE: slot stays alive, operation is peeked not taken.
+            // Impl in IoUring.MultishotRecv.cs.
+            if ((flags & IoUringConstants.CqeFMore) != 0)
+            {
+                DispatchMultishotCompletion(slotIndex, result, flags);
+                return;
+            }
+
             // Take the tracked operation
             ref IoUringTrackedOperationState entry = ref _trackedOperations![slotIndex];
             SocketAsyncContext.AsyncOperation? operation = Interlocked.Exchange(ref entry.TrackedOperation, null);
@@ -445,28 +469,47 @@ namespace System.Net.Sockets
             Volatile.Write(ref entry.TrackedOperationGeneration, 0UL);
             Interlocked.Decrement(ref _trackedIoUringOperationCount);
 
+            // Check if this is the terminal CQE of a multishot (no CQE_F_MORE).
+            // The slot's socket context handles cleanup.
+            bool wasMultishot = _completionSlotStorage![slotIndex].IsMultishot;
+            if (wasMultishot)
+            {
+                _completionSlotStorage[slotIndex].IsMultishot = false;
+                DispatchMultishotTerminal(slotIndex, operation, result, flags);
+            }
+
             // Free the slot
             FreeCompletionSlot(slotIndex);
 
-            // Process the result and dispatch callback
-            var completionResult = operation.ProcessIoUringCompletionResult(result, flags, 0);
-            switch (completionResult)
+            // Release socket handle ref
+            ref IoUringCompletionSlotStorage slotStorage = ref _completionSlotStorage[slotIndex];
+            if (wasMultishot && slotStorage.DangerousRefSocketHandle is not null)
             {
-                case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Completed:
-                    operation.ClearIoUringUserData();
-                    operation.AssociatedContext.TryCompleteIoUringOperation(operation);
-                    break;
+                slotStorage.DangerousRefSocketHandle.DangerousRelease();
+                slotStorage.DangerousRefSocketHandle = null;
+            }
 
-                case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Pending:
-                    // Partial send/recv — re-submit via io_uring
-                    operation.ClearIoUringUserData();
-                    operation.TryQueueIoUringPreparation();
-                    break;
+            if (!wasMultishot)
+            {
+                // Normal one-shot completion
+                var completionResult = operation.ProcessIoUringCompletionResult(result, flags, 0);
+                switch (completionResult)
+                {
+                    case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Completed:
+                        operation.ClearIoUringUserData();
+                        operation.AssociatedContext.TryCompleteIoUringOperation(operation);
+                        break;
 
-                case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Canceled:
-                case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Ignored:
-                    operation.ClearIoUringUserData();
-                    break;
+                    case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Pending:
+                        operation.ClearIoUringUserData();
+                        operation.TryQueueIoUringPreparation();
+                        break;
+
+                    case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Canceled:
+                    case SocketAsyncContext.AsyncOperation.IoUringCompletionResult.Ignored:
+                        operation.ClearIoUringUserData();
+                        break;
+                }
             }
         }
 
